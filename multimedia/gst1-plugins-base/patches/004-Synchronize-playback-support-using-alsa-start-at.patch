@@ -1,0 +1,932 @@
+From 7b497527256a20f0f3295327f17366a4408e668d Mon Sep 17 00:00:00 2001
+From: Abhilash Tuse <Abhilash.Tuse@imgtec.com>
+Date: Fri, 2 Dec 2016 15:15:34 +0530
+Subject: [PATCH 1/2] Synchronize playback support using alsa start-at
+
+Add gstalsaclock library that implements a custom GstClock that uses
+pcm driver interface to read high-precision audio hardware clock
+timestamps.
+
+Add property 'start-at' in alsasink for additional delay
+of the sink in nanoseconds to sync playback start in hardware.
+
+Change-Id: I8563d2149426a835a3590c10cd0d25299c9bf269
+Signed-off-by: Abhimanyu Vishwakarma <Abhimanyu.Vishwakarma@imgtec.com>
+Signed-off-by: Matin Momin <Matin.Momin@imgtec.com>
+Signed-off-by: Abhilash Tuse <Abhilash.Tuse@imgtec.com>
+---
+ configure.ac                                       |   8 +-
+ ext/alsa/gstalsasink.c                             | 178 +++++++++++++++-
+ ext/alsa/gstalsasink.h                             |   3 +
+ gst-libs/Makefile.am                               |   3 +-
+ gst-libs/ext/Makefile.am                           |   9 +
+ gst-libs/ext/alsaclock/Makefile.am                 |  20 ++
+ gst-libs/ext/alsaclock/gstalsaclock.c              | 232 +++++++++++++++++++++
+ gst-libs/ext/alsaclock/gstalsaclock.h              |  76 +++++++
+ gst-libs/gst/audio/gstaudiobasesink.c              |  39 +++-
+ gst-libs/gst/audio/gstaudiobasesink.h              |   5 +
+ pkgconfig/Makefile.am                              |   3 +
+ pkgconfig/gstreamer-alsaclock-uninstalled.pc.in    |  13 ++
+ pkgconfig/gstreamer-alsaclock.pc.in                |  11 +
+ pkgconfig/gstreamer-plugins-base-uninstalled.pc.in |   4 +-
+ pkgconfig/gstreamer-plugins-base.pc.in             |   2 +-
+ 15 files changed, 596 insertions(+), 10 deletions(-)
+ create mode 100644 gst-libs/ext/Makefile.am
+ create mode 100644 gst-libs/ext/alsaclock/Makefile.am
+ create mode 100644 gst-libs/ext/alsaclock/gstalsaclock.c
+ create mode 100644 gst-libs/ext/alsaclock/gstalsaclock.h
+ create mode 100644 pkgconfig/gstreamer-alsaclock-uninstalled.pc.in
+ create mode 100644 pkgconfig/gstreamer-alsaclock.pc.in
+
+diff --git a/configure.ac b/configure.ac
+index a18f1c8..a26160b 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -587,12 +587,12 @@ echo
+ dnl *** alsa ***
+ translit(dnm, m, l) AM_CONDITIONAL(USE_ALSA, true)
+ AG_GST_CHECK_FEATURE(ALSA, [ALSA], alsa, [
+-  PKG_CHECK_MODULES(ALSA, alsa >= 0.9.1, [
++  PKG_CHECK_MODULES(ALSA, alsa >= 1.0.29, [
+     HAVE_ALSA="yes"
+     AC_SUBST(ALSA_CFLAGS)
+     AC_SUBST(ALSA_LIBS)
+   ], [
+-    AM_PATH_ALSA(0.9.1, HAVE_ALSA="yes", HAVE_ALSA="no")
++    AM_PATH_ALSA(1.0.29, HAVE_ALSA="yes", HAVE_ALSA="no")
+   ])
+ ])
+ 
+@@ -868,6 +868,8 @@ ext/pango/Makefile
+ ext/theora/Makefile
+ ext/vorbis/Makefile
+ gst-libs/Makefile
++gst-libs/ext/Makefile
++gst-libs/ext/alsaclock/Makefile
+ gst-libs/gst/Makefile
+ gst-libs/gst/allocators/Makefile
+ gst-libs/gst/audio/Makefile
+@@ -885,6 +887,8 @@ tools/Makefile
+ pkgconfig/Makefile
+ pkgconfig/gstreamer-allocators.pc
+ pkgconfig/gstreamer-allocators-uninstalled.pc
++pkgconfig/gstreamer-alsaclock.pc
++pkgconfig/gstreamer-alsaclock-uninstalled.pc
+ pkgconfig/gstreamer-audio.pc
+ pkgconfig/gstreamer-audio-uninstalled.pc
+ pkgconfig/gstreamer-app.pc
+diff --git a/ext/alsa/gstalsasink.c b/ext/alsa/gstalsasink.c
+index 28f328e..410f703 100644
+--- a/ext/alsa/gstalsasink.c
++++ b/ext/alsa/gstalsasink.c
+@@ -43,6 +43,7 @@
+ #include <unistd.h>
+ #include <string.h>
+ #include <getopt.h>
++#include <limits.h>
+ #include <alsa/asoundlib.h>
+ 
+ #include "gstalsa.h"
+@@ -61,6 +62,7 @@
+ #define DEFAULT_CARD_NAME	""
+ #define SPDIF_PERIOD_SIZE 1536
+ #define SPDIF_BUFFER_SIZE 15360
++#define MAX_START_AT 7000000000
+ 
+ enum
+ {
+@@ -68,6 +70,8 @@ enum
+   PROP_DEVICE,
+   PROP_DEVICE_NAME,
+   PROP_CARD_NAME,
++  PROP_START_AT,
++  PROP_START_AT_SLAVE,
+   PROP_LAST
+ };
+ 
+@@ -97,6 +101,8 @@ static void gst_alsasink_reset (GstAudioSink * asink);
+ static gboolean gst_alsasink_acceptcaps (GstAlsaSink * alsa, GstCaps * caps);
+ static GstBuffer *gst_alsasink_payload (GstAudioBaseSink * sink,
+     GstBuffer * buf);
++static gboolean gst_alsasink_setup_render (GstAudioBaseSink * sink,
++    GstBuffer * buf);
+ 
+ static gint output_ref;         /* 0    */
+ static snd_output_t *output;    /* NULL */
+@@ -173,6 +179,8 @@ gst_alsasink_class_init (GstAlsaSinkClass * klass)
+   gstbasesink_class->query = GST_DEBUG_FUNCPTR (gst_alsasink_query);
+ 
+   gstbaseaudiosink_class->payload = GST_DEBUG_FUNCPTR (gst_alsasink_payload);
++  gstbaseaudiosink_class->setup_render =
++      GST_DEBUG_FUNCPTR (gst_alsasink_setup_render);
+ 
+   gstaudiosink_class->open = GST_DEBUG_FUNCPTR (gst_alsasink_open);
+   gstaudiosink_class->prepare = GST_DEBUG_FUNCPTR (gst_alsasink_prepare);
+@@ -196,6 +204,20 @@ gst_alsasink_class_init (GstAlsaSinkClass * klass)
+       g_param_spec_string ("card-name", "Card name",
+           "Human-readable name of the sound card", DEFAULT_CARD_NAME,
+           G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
++
++  g_object_class_install_property (gobject_class, PROP_START_AT,
++      g_param_spec_uint64 ("start-at", "Start at",
++          "Additional delay of the sink in nanoseconds to sync the playback "
++          "start in hardware (0 = disabled, sets slave-method property "
++          "to GST_AUDIO_BASE_SINK_SLAVE_NONE)",
++          0, MAX_START_AT, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
++  g_object_class_install_property (gobject_class, PROP_START_AT_SLAVE,
++      g_param_spec_boolean ("start-at-slave", "Start at slave mode",
++          "Based on this, sink decide how to interpret the buffer pts value"
++          "For slave buffer PTS is absolute pts so base_time addition is"
++          "not required", FALSE,
++          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ }
+ 
+ static void
+@@ -203,8 +225,10 @@ gst_alsasink_set_property (GObject * object, guint prop_id,
+     const GValue * value, GParamSpec * pspec)
+ {
+   GstAlsaSink *sink;
++  GstAudioBaseSink *basesink;
+ 
+   sink = GST_ALSA_SINK (object);
++  basesink = GST_AUDIO_BASE_SINK (object);
+ 
+   switch (prop_id) {
+     case PROP_DEVICE:
+@@ -215,6 +239,21 @@ gst_alsasink_set_property (GObject * object, guint prop_id,
+         sink->device = g_strdup (DEFAULT_DEVICE);
+       }
+       break;
++    case PROP_START_AT:
++      /* setting 'slave-method' property to GST_AUDIO_BASE_SINK_SLAVE_NONE,
++       * as to use 'start-at' property, internal audio clock has to be
++       * overridden with either GstSystemClock or GstAlsaClock. */
++      gst_audio_base_sink_set_slave_method (basesink,
++          GST_AUDIO_BASE_SINK_SLAVE_NONE);
++      /* Drop late data to ensure sync playback. The gap caused by late
++       * data will be filled by silence. */
++      gst_audio_base_sink_set_drop_on_late (basesink,
++          TRUE);
++      sink->start_at = g_value_get_uint64 (value);
++      break;
++    case PROP_START_AT_SLAVE:
++      sink->start_at_slave = g_value_get_boolean (value);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+@@ -243,6 +282,9 @@ gst_alsasink_get_property (GObject * object, guint prop_id,
+           gst_alsa_find_card_name (GST_OBJECT_CAST (sink),
+               sink->device, SND_PCM_STREAM_PLAYBACK));
+       break;
++    case PROP_START_AT:
++      g_value_set_uint64 (value, sink->start_at);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+@@ -436,7 +478,17 @@ set_hwparams (GstAlsaSink * alsa)
+   /* start with requested values, if we cannot configure alsa for those values,
+    * we set these values to -1, which will leave the default alsa values */
+   buffer_time = alsa->buffer_time;
+-  period_time = alsa->period_time;
++  if (alsa->start_at) {
++    /* For start_at based playback double the period time. With doubled
++     * period time, probablity of bug where master and slave play
++     * out of sync in multiples of 10msec is reduced considerably.
++     * Currently we don't know the reason for this behaviour.
++     * TODO(matin.momin) This is a HACK. Fix this issue properly.
++     */
++    period_time = alsa->period_time * 2;
++  } else {
++    period_time = alsa->period_time;
++  }
+ 
+ retry:
+   /* choose all parameters */
+@@ -921,6 +973,16 @@ gst_alsasink_prepare (GstAudioSink * asink, GstAudioRingBufferSpec * spec)
+   }
+ #endif /* SND_CHMAP_API_VERSION */
+ 
++  if (alsa->start_at != 0) {
++    /* filling period_size bytes with zero samples to satisfy start_at precondition */
++    gpointer zero_buffer;
++    gint length;
++    length = (alsa->bpf * alsa->channels * alsa->period_size);
++    zero_buffer = g_malloc0 (length);
++    gst_alsasink_write (asink, zero_buffer, length);
++    g_free (zero_buffer);
++  }
++
+   return TRUE;
+ 
+   /* ERRORS */
+@@ -1182,3 +1244,117 @@ gst_alsasink_payload (GstAudioBaseSink * sink, GstBuffer * buf)
+ 
+   return gst_buffer_ref (buf);
+ }
++
++static gboolean
++set_long_max_start_threshold (GstAlsaSink *alsa)
++{
++  snd_pcm_sw_params_t *params;
++  gint ret = FALSE;
++  gint err;
++
++  snd_pcm_sw_params_malloc (&params);
++
++  /* get the current swparams */
++  if ((err = snd_pcm_sw_params_current (alsa->handle, params)) < 0) {
++    GST_WARNING_OBJECT (alsa, "Error %d (%s) calling snd_pcm_sw_params_current",
++        err, snd_strerror (err));
++    goto failed;
++  }
++
++  /* for start-at based playback start the transfer when start-at */
++  /* time is reached. Hence set threshold to a very large value. */
++  if ((err = snd_pcm_sw_params_set_start_threshold (alsa->handle, params, LONG_MAX)) < 0) {
++    GST_WARNING_OBJECT (alsa, "Error %d (%s) calling snd_pcm_sw_params_set_start_threshold",
++        err, snd_strerror (err));
++    goto failed;
++  }
++
++  /* write the parameters to the playback device */
++  if ((err = snd_pcm_sw_params (alsa->handle, params)) < 0) {
++    GST_WARNING_OBJECT (alsa, "Error %d (%s) calling snd_pcm_sw_params",
++        err, snd_strerror (err));
++    goto failed;
++  }
++
++  ret = TRUE;
++
++failed:
++  snd_pcm_sw_params_free (params);
++
++  return ret;
++}
++
++static gboolean
++gst_alsasink_setup_render (GstAudioBaseSink * sink, GstBuffer * buf)
++{
++  GstAlsaSink *alsa;
++  GstBaseSink *bsink;
++
++  alsa = GST_ALSA_SINK (sink);
++  bsink = GST_BASE_SINK (alsa);
++
++  if (alsa->start_at != 0) {
++    const gchar *current_clock_type;
++    GstClockTime pts = 0;
++    GstClockTime start_pts = 0;
++    GstClockTime render_time = 0;
++    snd_htimestamp_t start_at;
++    GstSegment *segment = &bsink->segment;
++
++    pts = GST_BUFFER_PTS (buf);
++
++    if(alsa->start_at_slave) {
++      render_time = pts;
++    } else {
++      GstClockTime rt = gst_segment_to_running_time (segment, segment->format,
++                                                      pts);
++      render_time = GST_ELEMENT_CAST (sink)->base_time + rt;
++    }
++
++    start_pts = render_time + alsa->start_at;
++    GST_TIME_TO_TIMESPEC (start_pts, start_at);
++
++    /* start at can be set only if alsa is in prepared state and minimum
++     * buffer is queued. */
++    if (snd_pcm_state (alsa->handle) == SND_PCM_STATE_PREPARED
++        && (alsa->buffer_size - snd_pcm_avail (alsa->handle))
++        >= (2 * alsa->period_size)) {
++      GstClock *clock = gst_element_get_clock (GST_ELEMENT_CAST (sink));
++      GstClockTime now = gst_clock_get_time (clock);
++
++#ifndef GST_DISABLE_GST_DEBUG
++      GST_DEBUG_OBJECT (alsa, "buf_pts: %" G_GUINT64_FORMAT "start_at: %"
++                          G_GUINT64_FORMAT "now: %" G_GUINT64_FORMAT,
++                          GST_BUFFER_PTS (buf), start_pts, now);
++#endif
++      current_clock_type = G_OBJECT_TYPE_NAME (clock);
++      gst_object_unref(clock);
++
++      if (start_pts <= now) {
++        GST_DEBUG_OBJECT(alsa, "Buffer start_at PTS <= now, dropping buffer");
++        return FALSE;
++      }
++
++      if (!set_long_max_start_threshold (alsa)) {
++        GST_DEBUG_OBJECT (alsa, "failed to set LONG_MAX start threshold");
++        goto failed;
++      }
++
++      if (g_strcmp0 (current_clock_type, "GstAlsaClock") == 0) {
++        if (snd_pcm_start_at_audio (alsa->handle,
++                SND_PCM_AUDIO_TSTAMP_TYPE_COMPAT, &start_at) != 0)
++          goto failed;
++      } else if (g_strcmp0 (current_clock_type, "GstSystemClock") == 0) {
++        if (snd_pcm_start_at_system (alsa->handle,
++                SND_PCM_AUDIO_TSTAMP_TYPE_COMPAT, &start_at) != 0)
++          goto failed;
++      } else
++        goto failed;
++    }
++  }
++  return TRUE;
++
++failed:
++  GST_ELEMENT_ERROR (alsa, LIBRARY, FAILED, (NULL), ("failed to set start_at"));
++  return FALSE;
++}
+diff --git a/ext/alsa/gstalsasink.h b/ext/alsa/gstalsasink.h
+index 8c4c1b0..5156948 100644
+--- a/ext/alsa/gstalsasink.h
++++ b/ext/alsa/gstalsasink.h
+@@ -57,6 +57,9 @@ struct _GstAlsaSink {
+ 
+   gchar                 *device;
+ 
++  guint64               start_at;
++  gboolean              start_at_slave;
++
+   snd_pcm_t             *handle;
+   snd_pcm_hw_params_t   *hwparams;
+   snd_pcm_sw_params_t   *swparams;
+diff --git a/gst-libs/Makefile.am b/gst-libs/Makefile.am
+index 062cb55..1735517 100644
+--- a/gst-libs/Makefile.am
++++ b/gst-libs/Makefile.am
+@@ -1 +1,2 @@
+-SUBDIRS = gst
++SUBDIRS = gst \
++	  ext
+diff --git a/gst-libs/ext/Makefile.am b/gst-libs/ext/Makefile.am
+new file mode 100644
+index 0000000..eeb922d
+--- /dev/null
++++ b/gst-libs/ext/Makefile.am
+@@ -0,0 +1,9 @@
++if USE_ALSA
++ALSACLOCK_DIR=alsaclock
++else
++ALSACLOCK_DIR=
++endif
++
++SUBDIRS = $(ALSACLOCK_DIR)
++
++DIST_SUBDIRS = alsaclock
+\ No newline at end of file
+diff --git a/gst-libs/ext/alsaclock/Makefile.am b/gst-libs/ext/alsaclock/Makefile.am
+new file mode 100644
+index 0000000..34d53b1
+--- /dev/null
++++ b/gst-libs/ext/alsaclock/Makefile.am
+@@ -0,0 +1,20 @@
++lib_LTLIBRARIES = \
++	libgstalsaclock-@GST_API_VERSION@.la
++
++libgstalsaclock_@GST_API_VERSION@_la_SOURCES = \
++	gstalsaclock.c
++
++libgstalsaclock_@GST_API_VERSION@includedir = $(includedir)/gstreamer-@GST_API_VERSION@/ext/alsaclock
++libgstalsaclock_@GST_API_VERSION@include_HEADERS = \
++	gstalsaclock.h
++
++libgstalsaclock__@GST_API_VERSION@_la_CFLAGS = $(GST_CFLAGS) $(GLIB_CFLAGS) $(ALSA_CFLAGS)
++
++libgstalsaclock_@GST_API_VERSION@_la_CFLAGS = $(GST_PLUGINS_BASE_CFLAGS) $(GST_BASE_CFLAGS) \
++	$(GST_CFLAGS) $(ALSA_CFLAGS)
++libgstalsaclock_@GST_API_VERSION@_la_LIBADD = $(GST_PLUGINS_BASE_LIBS) $(GST_BASE_LIBS) \
++	$(GST_LIBS) $(ALSA_LIBS)
++libgstalsaclock_@GST_API_VERSION@_la_LDFLAGS = $(GST_LIB_LDFLAGS) $(GST_ALL_LDFLAGS) \
++	$(GST_LT_LDFLAGS)
++
++include $(top_srcdir)/common/gst-glib-gen.mak
+diff --git a/gst-libs/ext/alsaclock/gstalsaclock.c b/gst-libs/ext/alsaclock/gstalsaclock.c
+new file mode 100644
+index 0000000..abd0aef
+--- /dev/null
++++ b/gst-libs/ext/alsaclock/gstalsaclock.c
+@@ -0,0 +1,232 @@
++/* GStreamer
++ * Copyright (C) 2015 Imagination Technologies
++ *
++ * gstalsaclock.c:
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++/**
++ * SECTION:gstalsaclock
++ *
++ * @short_description: Special clock that uses pcm driver interface to read
++                       high-precision audio hardware clock timestamps.
++ *
++ * #GstAlsaClock implements a custom #GstClock that uses pcm driver interface
++   to read high-precision audio hardware clock timestamps.
++ *
++ * A new clock is created with gst_alsa_clock_new() which takes the name and
++ * control element identifier ASCII string.
++ *
++ * A #GstAlsaClock is typically set on a #GstPipeline with
++ * gst_pipeline_use_clock().
++ */
++#include "gstalsaclock.h"
++#include <gst/audio/gstaudioclock.h>
++#include <alsa/asoundlib.h>
++
++
++GST_DEBUG_CATEGORY_STATIC (alsa_clock_debug);
++#define GST_CAT_DEFAULT alsa_clock_debug
++
++#define _do_init \
++    GST_DEBUG_CATEGORY_INIT (alsa_clock_debug, "alsaclock", 0, "alsaclock");
++#define gst_alsa_clock_parent_class parent_class
++G_DEFINE_TYPE_WITH_CODE (GstAlsaClock, gst_alsa_clock,
++    GST_TYPE_CLOCK, _do_init);
++
++struct _GstAlsaClockPrivate
++{
++  snd_ctl_elem_info_t *control_info;
++  snd_ctl_elem_id_t *control_id;
++  snd_ctl_elem_value_t *control_value;
++  snd_hctl_t *control_hctl;
++  snd_hctl_elem_t *control_elem;
++};
++
++#define GST_ALSA_CLOCK_GET_PRIVATE(obj)  \
++   (G_TYPE_INSTANCE_GET_PRIVATE ((obj), GST_TYPE_ALSA_CLOCK, \
++        GstAlsaClockPrivate))
++
++static void gst_alsa_clock_finalize (GObject * object);
++static GstClockTime gst_alsa_clock_get_internal_time (GstClock * clock);
++
++static gboolean
++prepare (GstAlsaClock * alsa_clock, const gchar * control_device,
++    const gchar * control_id)
++{
++  snd_ctl_t *control_handle = NULL;
++  gint err;
++
++  alsa_clock->priv->control_hctl = NULL;
++
++  if ((err =
++          snd_ctl_ascii_elem_id_parse (alsa_clock->priv->control_id,
++              control_id)) != 0) {
++    GST_ERROR_OBJECT (alsa_clock,
++        "Invalid control identifier: %s, failed to parse: %s, prepare failed.",
++        control_id, snd_strerror (err));
++    goto error;
++  }
++
++  if ((err = snd_ctl_open (&control_handle, control_device, 0)) != 0) {
++    GST_ERROR_OBJECT (alsa_clock,
++        "Cannot open control device %s: %s, prepare failed.", control_device,
++        snd_strerror (err));
++    goto error;
++  }
++
++  snd_ctl_elem_info_set_id (alsa_clock->priv->control_info,
++      alsa_clock->priv->control_id);
++  if ((err =
++          snd_ctl_elem_info (control_handle,
++              alsa_clock->priv->control_info)) != 0) {
++    GST_ERROR_OBJECT (alsa_clock,
++        "Cannot get control element information: %s, prepare failed.",
++        snd_strerror (err));
++    goto error;
++  }
++
++  snd_ctl_close (control_handle);
++  control_handle = NULL;
++
++  snd_ctl_elem_info_get_id (alsa_clock->priv->control_info,
++      alsa_clock->priv->control_id);
++
++  if ((err =
++          snd_hctl_open (&alsa_clock->priv->control_hctl, control_device,
++              0)) != 0) {
++    GST_ERROR_OBJECT (alsa_clock,
++        "Cannot open HCTL control device %s: %s, prepare failed.",
++        control_device, snd_strerror (err));
++    goto error;
++  }
++
++  if ((err = snd_hctl_load (alsa_clock->priv->control_hctl)) != 0) {
++    GST_ERROR_OBJECT (alsa_clock, "Cannot load HCTL: %s, prepare failed.",
++        snd_strerror (err));
++    goto error;
++  }
++
++  alsa_clock->priv->control_elem =
++      snd_hctl_find_elem (alsa_clock->priv->control_hctl,
++      alsa_clock->priv->control_id);
++  if (!alsa_clock->priv->control_elem) {
++    GST_ERROR_OBJECT (alsa_clock,
++        "Cannot find HCTL element: %s, prepare failed.", snd_strerror (err));
++    goto error;
++  }
++
++  return TRUE;
++
++error:
++  if (control_handle)
++    snd_ctl_close (control_handle);
++
++  if (alsa_clock->priv->control_hctl)
++    snd_hctl_close (alsa_clock->priv->control_hctl);
++
++  return FALSE;
++}
++
++static void
++gst_alsa_clock_class_init (GstAlsaClockClass * klass)
++{
++  GObjectClass *gobject_class;
++  GstClockClass *gstclock_class;
++
++  gobject_class = (GObjectClass *) klass;
++  gstclock_class = (GstClockClass *) klass;
++
++  g_type_class_add_private (klass, sizeof (GstAlsaClockPrivate));
++
++  gobject_class->finalize = gst_alsa_clock_finalize;
++
++  gstclock_class->get_internal_time = gst_alsa_clock_get_internal_time;
++}
++
++static void
++gst_alsa_clock_init (GstAlsaClock * clock)
++{
++  GST_OBJECT_FLAG_SET (clock, GST_CLOCK_FLAG_CAN_SET_MASTER);
++
++  clock->priv = GST_ALSA_CLOCK_GET_PRIVATE (clock);
++
++  snd_ctl_elem_info_malloc (&clock->priv->control_info);
++  snd_ctl_elem_id_malloc (&clock->priv->control_id);
++  snd_ctl_elem_value_malloc (&clock->priv->control_value);
++}
++
++static void
++gst_alsa_clock_finalize (GObject * object)
++{
++  GstAlsaClock *self = GST_ALSA_CLOCK (object);
++
++  if (self->priv->control_hctl)
++    snd_hctl_close (self->priv->control_hctl);
++
++  /* Free resources */
++  if (self->priv->control_info)
++    snd_ctl_elem_info_free (self->priv->control_info);
++
++  if (self->priv->control_id)
++    snd_ctl_elem_id_free (self->priv->control_id);
++
++  if (self->priv->control_value)
++    snd_ctl_elem_value_free (self->priv->control_value);
++
++  G_OBJECT_CLASS (parent_class)->finalize (object);
++}
++
++static GstClockTime
++gst_alsa_clock_get_internal_time (GstClock * clock)
++{
++  struct timespec ts;
++  gint err;
++  GstAlsaClock *alsa_clock = GST_ALSA_CLOCK_CAST (clock);
++
++  if ((err = snd_hctl_elem_read (alsa_clock->priv->control_elem,
++              alsa_clock->priv->control_value)) != 0) {
++    GST_ERROR_OBJECT (alsa_clock, "Cannot read HCTL element value: %s",
++        snd_strerror (err));
++    return GST_CLOCK_TIME_NONE;
++  }
++
++  ts.tv_sec =
++      snd_ctl_elem_value_get_integer64 (alsa_clock->priv->control_value, 0);
++  ts.tv_nsec =
++      snd_ctl_elem_value_get_integer64 (alsa_clock->priv->control_value, 1);
++
++  return GST_TIMESPEC_TO_TIME (ts);
++}
++
++GstClock *
++gst_alsa_clock_new (const gchar * name, const gchar * control_device,
++    const gchar * control_id)
++{
++  GstAlsaClock *alsa_clock =
++      g_object_new (GST_TYPE_ALSA_CLOCK, "name", name, NULL);
++
++  if (!prepare (alsa_clock, control_device, control_id)) {
++    goto prepare_failed;
++  }
++
++  return GST_CLOCK (alsa_clock);
++
++prepare_failed:
++  gst_object_unref (alsa_clock);
++  return NULL;
++}
+diff --git a/gst-libs/ext/alsaclock/gstalsaclock.h b/gst-libs/ext/alsaclock/gstalsaclock.h
+new file mode 100644
+index 0000000..bb18ab7
+--- /dev/null
++++ b/gst-libs/ext/alsaclock/gstalsaclock.h
+@@ -0,0 +1,76 @@
++/* GStreamer
++ * Copyright (C)  2015 Imagination Technologies
++ *
++ * gstalsaclock.h:
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++
++#ifndef __GST_ALSA_CLOCK_H__
++#define __GST_ALSA_CLOCK_H__
++
++#include <gst/gst.h>
++#include <gst/gstclock.h>
++
++G_BEGIN_DECLS
++
++#define GST_TYPE_ALSA_CLOCK \
++  (gst_alsa_clock_get_type ())
++#define GST_ALSA_CLOCK(obj) \
++  (G_TYPE_CHECK_INSTANCE_CAST ((obj), GST_TYPE_ALSA_CLOCK, GstAlsaClock))
++#define GST_ALSA_CLOCK_CAST(obj) \
++  ((GstAlsaClock *)(obj))
++#define GST_IS_ALSA_CLOCK(obj) \
++  (G_TYPE_CHECK_INSTANCE_TYPE ((obj), GST_TYPE_ALSA_CLOCK))
++#define GST_ALSA_CLOCK_CLASS(klass) \
++  (G_TYPE_CHECK_CLASS_CAST ((klass), GST_TYPE_ALSA_CLOCK, GstAlsaClockClass))
++#define GST_IS_ALSA_CLOCK_CLASS(klass) \
++  (G_TYPE_CHECK_CLASS_TYPE ((klass), GST_TYPE_ALSA_CLOCK))
++
++typedef struct _GstAlsaClock GstAlsaClock;
++typedef struct _GstAlsaClockClass GstAlsaClockClass;
++typedef struct _GstAlsaClockPrivate GstAlsaClockPrivate;
++
++/**
++ * GstAlsaClock:
++ *
++ * Implementation of a #GstClock that uses the alsa time.
++ */
++struct _GstAlsaClock {
++  GstSystemClock       clock;
++
++  /*< private >*/
++  GstAlsaClockPrivate *priv;
++
++  gpointer _gst_reserved[GST_PADDING];
++};
++
++struct _GstAlsaClockClass {
++  GstSystemClockClass parent_class;
++
++  gpointer _gst_reserved[GST_PADDING];
++};
++
++GType                   gst_alsa_clock_get_type       (void);
++
++GstClock*               gst_alsa_clock_new            (const gchar * name,
++                                                       const gchar * control_device,
++                                                       const gchar * control_id);
++
++G_END_DECLS
++
++#endif /* __GST_ALSA_CLOCK_H__ */
+diff --git a/gst-libs/gst/audio/gstaudiobasesink.c b/gst-libs/gst/audio/gstaudiobasesink.c
+index 62fab35..89329e0 100644
+--- a/gst-libs/gst/audio/gstaudiobasesink.c
++++ b/gst-libs/gst/audio/gstaudiobasesink.c
+@@ -74,6 +74,9 @@ struct _GstAudioBaseSinkPrivate
+   GstAudioBaseSinkCustomSlavingCallback custom_slaving_callback;
+   gpointer custom_slaving_cb_data;
+   GDestroyNotify custom_slaving_cb_notify;
++
++  /* drop data if late */
++  gboolean drop_on_late;
+ };
+ 
+ /* BaseAudioSink signals and args */
+@@ -189,7 +192,6 @@ static GstCaps *gst_audio_base_sink_fixate (GstBaseSink * bsink,
+ static gboolean gst_audio_base_sink_query_pad (GstBaseSink * bsink,
+     GstQuery * query);
+ 
+-
+ /* static guint gst_audio_base_sink_signals[LAST_SIGNAL] = { 0 }; */
+ 
+ static void
+@@ -314,6 +316,7 @@ gst_audio_base_sink_init (GstAudioBaseSink * audiobasesink)
+   audiobasesink->priv->custom_slaving_callback = NULL;
+   audiobasesink->priv->custom_slaving_cb_data = NULL;
+   audiobasesink->priv->custom_slaving_cb_notify = NULL;
++  audiobasesink->priv->drop_on_late = FALSE;
+ 
+   audiobasesink->provided_clock = gst_audio_clock_new ("GstAudioSinkClock",
+       (GstAudioClockGetTimeFunc) gst_audio_base_sink_get_time, audiobasesink,
+@@ -845,6 +848,24 @@ gst_audio_base_sink_get_discont_wait (GstAudioBaseSink * sink)
+   return result;
+ }
+ 
++/**
++ * gst_audio_base_sink_set_drop_on_late:
++ * @sink: a #GstAudioBaseSink
++ *
++ * Configures whether @sink should drop late data or not.
++ */
++void
++gst_audio_base_sink_set_drop_on_late (GstAudioBaseSink * sink,
++    gboolean drop_on_late)
++{
++  g_return_if_fail (GST_IS_AUDIO_BASE_SINK (sink));
++
++  GST_OBJECT_LOCK (sink);
++  sink->priv->drop_on_late = drop_on_late;
++  GST_OBJECT_UNLOCK (sink);
++}
++
++
+ static void
+ gst_audio_base_sink_set_property (GObject * object, guint prop_id,
+     const GValue * value, GParamSpec * pspec)
+@@ -1244,8 +1265,13 @@ gst_audio_base_sink_get_offset (GstAudioBaseSink * sink)
+   /* see how far away it is from the write segment */
+   diff = writeseg - segdone;
+   if (diff < 0) {
+-    /* sample would be dropped, position to next playable position */
+-    sample = (segdone + 1) * sps;
++    if (!sink->priv->drop_on_late) {
++      /* sample would be dropped, position to next playable position */
++      sample = (segdone + 1) * sps;
++    } else {
++      GST_DEBUG_OBJECT (sink, "Dropping %" G_GUINT64_FORMAT " late samples",
++                         -(diff * sps));
++    }
+   }
+ 
+   return sample;
+@@ -1848,6 +1874,12 @@ gst_audio_base_sink_render (GstBaseSink * bsink, GstBuffer * buf)
+   if (G_UNLIKELY (!gst_audio_ring_buffer_is_acquired (ringbuf)))
+     goto wrong_state;
+ 
++  if (bclass->setup_render) {
++    if (!bclass->setup_render (sink, buf)) {
++      goto too_late;
++    }
++  }
++
+   /* Wait for upstream latency before starting the ringbuffer, we do this so
+    * that we can align the first sample of the ringbuffer to the base_time +
+    * latency. */
+@@ -2079,6 +2111,7 @@ gst_audio_base_sink_render (GstBaseSink * bsink, GstBuffer * buf)
+   if (G_UNLIKELY (render_start == 0 && render_stop == 0))
+     goto too_late;
+ 
++
+   /* and bring the time to the rate corrected offset in the buffer */
+   render_start = gst_util_uint64_scale_int (render_start, rate, GST_SECOND);
+   render_stop = gst_util_uint64_scale_int (render_stop, rate, GST_SECOND);
+diff --git a/gst-libs/gst/audio/gstaudiobasesink.h b/gst-libs/gst/audio/gstaudiobasesink.h
+index 8c709bd..863641c 100644
+--- a/gst-libs/gst/audio/gstaudiobasesink.h
++++ b/gst-libs/gst/audio/gstaudiobasesink.h
+@@ -218,6 +218,9 @@ struct _GstAudioBaseSinkClass {
+   /* subclass payloader */
+   GstBuffer*          (*payload)            (GstAudioBaseSink *sink,
+                                              GstBuffer        *buffer);
++
++  gboolean            (*setup_render)       (GstAudioBaseSink *sink,
++                                             GstBuffer        *buf);
+   /*< private >*/
+   gpointer _gst_reserved[GST_PADDING];
+ };
+@@ -258,6 +261,8 @@ gst_audio_base_sink_set_custom_slaving_callback        (GstAudioBaseSink * sink,
+ 
+ void gst_audio_base_sink_report_device_failure         (GstAudioBaseSink * sink);
+ 
++void      gst_audio_base_sink_set_drop_on_late         (GstAudioBaseSink * sink, gboolean drop_on_late);
++
+ #ifdef G_DEFINE_AUTOPTR_CLEANUP_FUNC
+ G_DEFINE_AUTOPTR_CLEANUP_FUNC(GstAudioBaseSink, gst_object_unref)
+ #endif
+diff --git a/pkgconfig/Makefile.am b/pkgconfig/Makefile.am
+index 9976f95..ee42a05 100644
+--- a/pkgconfig/Makefile.am
++++ b/pkgconfig/Makefile.am
+@@ -1,6 +1,7 @@
+ ### all of the standard pc files we need to generate
+ pcverfiles =  \
+ 	gstreamer-allocators-@GST_API_VERSION@.pc \
++	gstreamer-alsaclock-@GST_API_VERSION@.pc \
+ 	gstreamer-audio-@GST_API_VERSION@.pc \
+ 	gstreamer-app-@GST_API_VERSION@.pc \
+ 	gstreamer-fft-@GST_API_VERSION@.pc \
+@@ -14,6 +15,7 @@ pcverfiles =  \
+ 	gstreamer-plugins-base-@GST_API_VERSION@.pc
+ pcverfiles_uninstalled = \
+ 	gstreamer-allocators-@GST_API_VERSION@-uninstalled.pc \
++	gstreamer-alsaclock-@GST_API_VERSION@-uninstalled.pc \
+ 	gstreamer-audio-@GST_API_VERSION@-uninstalled.pc \
+ 	gstreamer-app-@GST_API_VERSION@-uninstalled.pc \
+ 	gstreamer-fft-@GST_API_VERSION@-uninstalled.pc \
+@@ -44,6 +46,7 @@ pkgconfig_DATA = $(pcverfiles)
+ CLEANFILES = $(pcverfiles) $(pcverfiles_uninstalled)
+ pcinfiles = \
+ 		   gstreamer-allocators.pc.in gstreamer-allocators-uninstalled.pc.in \
++		   gstreamer-alsaclock.pc.in gstreamer-alsaclock-uninstalled.pc.in \
+            gstreamer-audio.pc.in gstreamer-audio-uninstalled.pc.in \
+            gstreamer-app.pc.in gstreamer-app-uninstalled.pc.in \
+            gstreamer-fft.pc.in gstreamer-fft-uninstalled.pc.in \
+diff --git a/pkgconfig/gstreamer-alsaclock-uninstalled.pc.in b/pkgconfig/gstreamer-alsaclock-uninstalled.pc.in
+new file mode 100644
+index 0000000..89e7c41
+--- /dev/null
++++ b/pkgconfig/gstreamer-alsaclock-uninstalled.pc.in
+@@ -0,0 +1,13 @@
++# the standard variables don't make sense for an uninstalled copy
++prefix=
++exec_prefix=
++libdir=
++# includedir is builddir because it is used to find gstconfig.h in places
++includedir=@abs_top_builddir@/gst-libs
++
++Name: GStreamer Alsa Clock Library, Uninstalled
++Description: Alsa Clock implementation, uninstalled
++Version: @VERSION@
++Requires: gstreamer-@GST_API_VERSION@ alsa >= 1.0.29
++Libs: @abs_top_builddir@/gst-libs/ext/alsaclock/libgstalsaclock-@GST_API_VERSION@.la
++Cflags: -I@abs_top_srcdir@/gst-libs -I@abs_top_builddir@/gst-libs
+diff --git a/pkgconfig/gstreamer-alsaclock.pc.in b/pkgconfig/gstreamer-alsaclock.pc.in
+new file mode 100644
+index 0000000..ec961dc
+--- /dev/null
++++ b/pkgconfig/gstreamer-alsaclock.pc.in
+@@ -0,0 +1,11 @@
++prefix=@prefix@
++exec_prefix=@exec_prefix@
++libdir=@libdir@
++includedir=@includedir@
++
++Name: Gstreamer Alsa Clock Library
++Description: ALSA Clock implementation
++Requires: gstreamer-@GST_API_VERSION@ alsa >= 1.0.29
++Version: @VERSION@
++Libs: -L${libdir} -lgstalsaclock-@GST_API_VERSION@
++Cflags: -I{includedir}
+diff --git a/pkgconfig/gstreamer-plugins-base-uninstalled.pc.in b/pkgconfig/gstreamer-plugins-base-uninstalled.pc.in
+index eaf378b..b89cbfa 100644
+--- a/pkgconfig/gstreamer-plugins-base-uninstalled.pc.in
++++ b/pkgconfig/gstreamer-plugins-base-uninstalled.pc.in
+@@ -10,7 +10,7 @@ Name: GStreamer Base Plugins Libraries, Uninstalled
+ Description: Streaming media framework, base plugins libraries, uninstalled
+ Version: @VERSION@
+ Requires: gstreamer-@GST_API_VERSION@
+-Libs: -L@abs_top_builddir@/gst-libs/gst/allocators/.libs -L@abs_top_builddir@/gst-libs/gst/app/.libs -L@abs_top_builddir@/gst-libs/gst/audio/.libs -L@abs_top_builddir@/gst-libs/gst/fft/.libs -L@abs_top_builddir@/gst-libs/gst/pbutils/.libs -L@abs_top_builddir@/gst-libs/gst/riff/.libs -L@abs_top_builddir@/gst-libs/gst/rtp/.libs -L@abs_top_builddir@/gst-libs/gst/rtsp/.libs -L@abs_top_builddir@/gst-libs/gst/sdp/.libs -L@abs_top_builddir@/gst-libs/gst/tag/.libs -L@abs_top_builddir@/gst-libs/gst/video/.libs
++Libs: -L@abs_top_builddir@/gst-libs/ext/alsaclock/.libs -L@abs_top_builddir@/gst-libs/gst/allocators/.libs -L@abs_top_builddir@/gst-libs/gst/app/.libs -L@abs_top_builddir@/gst-libs/gst/audio/.libs -L@abs_top_builddir@/gst-libs/gst/fft/.libs -L@abs_top_builddir@/gst-libs/gst/pbutils/.libs -L@abs_top_builddir@/gst-libs/gst/riff/.libs -L@abs_top_builddir@/gst-libs/gst/rtp/.libs -L@abs_top_builddir@/gst-libs/gst/rtsp/.libs -L@abs_top_builddir@/gst-libs/gst/sdp/.libs -L@abs_top_builddir@/gst-libs/gst/tag/.libs -L@abs_top_builddir@/gst-libs/gst/video/.libs
+ Cflags: -I@abs_top_srcdir@/gst-libs -I@abs_top_builddir@/gst-libs
+ 
+-libraries=allocators app audio fft pbutils riff rtp rtsp sdp tag video
++libraries=allocators alsaclock app audio fft pbutils riff rtp rtsp sdp tag video
+diff --git a/pkgconfig/gstreamer-plugins-base.pc.in b/pkgconfig/gstreamer-plugins-base.pc.in
+index e817746..14e6764 100644
+--- a/pkgconfig/gstreamer-plugins-base.pc.in
++++ b/pkgconfig/gstreamer-plugins-base.pc.in
+@@ -11,4 +11,4 @@ Version: @VERSION@
+ Libs: -L${libdir}
+ Cflags: -I${includedir}
+ 
+-libraries=allocators app audio fft pbutils riff rtp rtsp sdp tag video
++libraries=allocators alsaclock app audio fft pbutils riff rtp rtsp sdp tag video
+-- 
+2.6.2
+

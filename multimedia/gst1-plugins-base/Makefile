@@ -221,6 +221,7 @@ define GstBuildLibrary
 endef
 
 $(eval $(call GstBuildLibrary,allocators,allocators,,))
+$(eval $(call GstBuildLibrary,alsaclock,alsaclock,,+alsa-lib,))
 $(eval $(call GstBuildLibrary,app,app,,))
 $(eval $(call GstBuildLibrary,audio,audio,tag,))
 $(eval $(call GstBuildLibrary,fft,FFT,,))
