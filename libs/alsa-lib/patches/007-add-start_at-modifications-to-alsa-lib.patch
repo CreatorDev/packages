@@ -1,0 +1,1230 @@
+From 122568912d017108ff7e04de05891cb47f3cab8a Mon Sep 17 00:00:00 2001
+From: Abhilash Tuse <Abhilash.Tuse@imgtec.com>
+Date: Fri, 25 Nov 2016 15:56:15 +0530
+Subject: [PATCH] add start_at modifications to alsa-lib
+
+Add API for starting a playback stream at a specified absolute
+time. Both system (posix) and audio hardware clocks are supported.
+
+Use snd_pcm_start_at_system() for system clocks, and
+snd_pcm_start_at_audio() for audio clocks.
+
+snd_pcm_start_at_abort() cancels a previous start_at request.
+
+Signed-off-by: Damien.Horsley <Damien.Horsley@imgtec.com>
+Signed-off-by: Abhilash Tuse <Abhilash.Tuse@imgtec.com>
+---
+ include/pcm.h          | 22 +++++++++++-
+ include/sound/asound.h | 22 ++++++++++++
+ src/pcm/pcm.c          | 93 ++++++++++++++++++++++++++++++++++++++++++++++----
+ src/pcm/pcm_dmix.c     | 40 +++++++++++++++++-----
+ src/pcm/pcm_dshare.c   | 33 ++++++++++++++----
+ src/pcm/pcm_dsnoop.c   | 33 +++++++++++++++---
+ src/pcm/pcm_file.c     | 12 +++++++
+ src/pcm/pcm_hooks.c    | 11 ++++++
+ src/pcm/pcm_hw.c       | 24 +++++++++++++
+ src/pcm/pcm_local.h    |  5 ++-
+ src/pcm/pcm_meter.c    | 12 +++++++
+ src/pcm/pcm_mmap.c     |  8 ++---
+ src/pcm/pcm_multi.c    | 25 ++++++++++++++
+ src/pcm/pcm_null.c     | 13 +++++++
+ src/pcm/pcm_plugin.c   | 12 +++++++
+ src/pcm/pcm_rate.c     | 11 ++++++
+ src/pcm/pcm_share.c    | 42 ++++++++++++++++++-----
+ test/pcm.c             |  5 ++-
+ 18 files changed, 383 insertions(+), 40 deletions(-)
+
+diff --git a/include/pcm.h b/include/pcm.h
+index 0be1a32..b0542e9 100644
+--- a/include/pcm.h
++++ b/include/pcm.h
+@@ -289,7 +289,9 @@ typedef enum _snd_pcm_state {
+ 	SND_PCM_STATE_SUSPENDED,
+ 	/** Hardware is disconnected */
+ 	SND_PCM_STATE_DISCONNECTED,
+-	SND_PCM_STATE_LAST = SND_PCM_STATE_DISCONNECTED
++	/** Stream is starting on a start_at timer */
++	SND_PCM_STATE_STARTING,
++	SND_PCM_STATE_LAST = SND_PCM_STATE_STARTING,
+ } snd_pcm_state_t;
+ 
+ /** PCM start mode */
+@@ -330,6 +332,22 @@ typedef enum _snd_pcm_tstamp_type {
+ 	SND_PCM_TSTAMP_TYPE_LAST = SND_PCM_TSTAMP_TYPE_MONOTONIC_RAW,
+ } snd_pcm_tstamp_type_t;
+ 
++typedef enum _snd_pcm_audio_tstamp_type {
++	/*
++	 *  first definition for backwards compatibility only,
++	 *  maps to wallclock/link time for HDAudio playback and DEFAULT/DMA time for everything else
++	 */
++	SND_PCM_AUDIO_TSTAMP_TYPE_COMPAT = 0,
++
++	/* timestamp definitions */
++	SND_PCM_AUDIO_TSTAMP_TYPE_DEFAULT = 1,           /* DMA time, reported as per hw_ptr */
++	SND_PCM_AUDIO_TSTAMP_TYPE_LINK = 2,              /* link time reported by sample or wallclock counter, reset on startup */
++	SND_PCM_AUDIO_TSTAMP_TYPE_LINK_ABSOLUTE = 3,     /* link time reported by sample or wallclock counter, not reset on startup */
++	SND_PCM_AUDIO_TSTAMP_TYPE_LINK_ESTIMATED = 4,    /* link time estimated indirectly */
++	SND_PCM_AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED = 5, /* link time synchronized with system time */
++	SND_PCM_AUDIO_TSTAMP_TYPE_LAST = SND_PCM_AUDIO_TSTAMP_TYPE_LINK_SYNCHRONIZED
++} snd_pcm_audio_tstamp_type_t;
++
+ typedef struct _snd_pcm_audio_tstamp_config {
+ 	/* 5 of max 16 bits used */
+ 	unsigned int type_requested:4;
+@@ -498,6 +516,8 @@ int snd_pcm_prepare(snd_pcm_t *pcm);
+ int snd_pcm_reset(snd_pcm_t *pcm);
+ int snd_pcm_status(snd_pcm_t *pcm, snd_pcm_status_t *status);
+ int snd_pcm_start(snd_pcm_t *pcm);
++int snd_pcm_start_at_system(snd_pcm_t *pcm, snd_pcm_tstamp_type_t system_clock_type, const snd_htimestamp_t* start_time);
++int snd_pcm_start_at_audio(snd_pcm_t *pcm, snd_pcm_audio_tstamp_type_t audio_clock_type, const snd_htimestamp_t* start_time);
+ int snd_pcm_drop(snd_pcm_t *pcm);
+ int snd_pcm_drain(snd_pcm_t *pcm);
+ int snd_pcm_pause(snd_pcm_t *pcm, int enable);
+diff --git a/include/sound/asound.h b/include/sound/asound.h
+index 67bf49d..af1ea6d 100644
+--- a/include/sound/asound.h
++++ b/include/sound/asound.h
+@@ -297,6 +297,7 @@ typedef int __bitwise snd_pcm_state_t;
+ #define	SNDRV_PCM_STATE_PAUSED		((__force snd_pcm_state_t) 6) /* stream is paused */
+ #define	SNDRV_PCM_STATE_SUSPENDED	((__force snd_pcm_state_t) 7) /* hardware is suspended */
+ #define	SNDRV_PCM_STATE_DISCONNECTED	((__force snd_pcm_state_t) 8) /* hardware is disconnected */
++#define SNDRV_PCM_STATE_STARTING        ((__force snd_pcm_state_t) 9) /* stream start has been delegated to the kernel */
+ #define	SNDRV_PCM_STATE_LAST		SNDRV_PCM_STATE_DISCONNECTED
+ 
+ enum {
+@@ -507,6 +508,26 @@ enum {
+ 	SNDRV_PCM_TSTAMP_TYPE_LAST = SNDRV_PCM_TSTAMP_TYPE_MONOTONIC_RAW,
+ };
+ 
++enum {
++	SNDRV_PCM_CLOCK_CLASS_SYSTEM = 0,
++	SNDRV_PCM_CLOCK_CLASS_AUDIO,
++	SNDRV_PCM_CLOCK_CLASS_LAST = SNDRV_PCM_CLOCK_CLASS_AUDIO,
++};
++
++struct snd_pcm_startat_state {
++	int pending;                    /* 0 or 1 */
++	int clock_class;                /* SNDRV_PCM_CLOCK_CLASS_* */
++	int clock_type;                 /* SNDRV_PCM_TSTAMP_* or
++	                                         * SNDRV_PCM_AUDIO_TSTAMP_TYPE_* */
++	struct timespec start_time;
++};
++
++struct snd_startat {
++	int clock_class;
++	int clock_type;
++	struct timespec start_time;
++};
++
+ /* channel positions */
+ enum {
+ 	SNDRV_CHMAP_UNKNOWN = 0,
+@@ -586,6 +607,7 @@ enum {
+ #define SNDRV_PCM_IOCTL_READN_FRAMES	_IOR('A', 0x53, struct snd_xfern)
+ #define SNDRV_PCM_IOCTL_LINK		_IOW('A', 0x60, int)
+ #define SNDRV_PCM_IOCTL_UNLINK		_IO('A', 0x61)
++#define SNDRV_PCM_IOCTL_START_AT        _IOW('A', 0x62, struct snd_startat)
+ 
+ /*****************************************************************************
+  *                                                                           *
+diff --git a/src/pcm/pcm.c b/src/pcm/pcm.c
+index 203e7a5..94422e1 100644
+--- a/src/pcm/pcm.c
++++ b/src/pcm/pcm.c
+@@ -206,6 +206,11 @@ to leave this state.
+ \par SND_PCM_STATE_DISCONNECTED
+ The device is physicaly disconnected. It does not accept any I/O calls in this state.
+ 
++\par SND_PCM_STATE_STARTING
++The device is waiting to start on a kernel/hardware timer. Abort by calling
++#snd_pcm_drop().
++
++
+ \section pcm_formats PCM formats
+ 
+ The full list of formats present the #snd_pcm_format_t type.
+@@ -448,6 +453,14 @@ to the #SND_PCM_STATE_PREPARED after a successful finish.
+ The #snd_pcm_start() function enters
+ the #SND_PCM_STATE_RUNNING after a successful finish.
+ 
++\par snd_pcm_start_at_system
++The #snd_pcm_start_at_system function starts the stream
++at an abolute time with respect to the specified system clock.
++
++\par snd_pcm_start_at_audio
++The #snd_pcm_start_at_audio function starts the stream
++at an abolute time with respect to the specified audio clock.
++
+ \par snd_pcm_drop
+ The #snd_pcm_drop() function enters the
+ #SND_PCM_STATE_SETUP state.
+@@ -1083,6 +1096,61 @@ int snd_pcm_start(snd_pcm_t *pcm)
+ 	return pcm->fast_ops->start(pcm->fast_op_arg);
+ }
+ 
++static int snd_pcm_start_at(snd_pcm_t* pcm, int clock_class, int clock_type, const snd_htimestamp_t *start_time)
++{
++	assert(pcm);
++	assert(start_time);
++	if (CHECK_SANITY(! pcm->setup)) {
++		SNDMSG("PCM not set up");
++		return -EIO;
++	}
++	if (pcm->fast_ops->start_at) {
++		return pcm->fast_ops->start_at(pcm->fast_op_arg, clock_class, clock_type, start_time);
++	}
++	return -EINVAL;
++}
++
++/**
++ * \brief Start a PCM at a future time, according to a system clock
++ * \param pcm PCM handle
++ * \param system_clock_type Specifies the system clock with which to interpret \p start_time
++ * \param start_time Absolute time at which to start the stream
++ * \return 0 on success otherwise a negative error code
++ * \retval -ENOSYS operation not supported for the current timestamp type
++ * \retval -EINPROGRESS start_at timer is already active
++ * \retval -EINVAL timespec, tstamp_class or tstamp_type is invalid
++ * \retval -ETIME requested start_time cannot be satisfied
++ *
++ * This method is non-blocking: It establishes an appropriate timer in the kernel
++ * that will start the stream on expiry. The stream moves to #SND_PCM_STATE_STARTING.
++ * Use #snd_pcm_drop() to abort and return to #SND_PCM_STATE_SETUP.
++ */
++int snd_pcm_start_at_system(snd_pcm_t *pcm, snd_pcm_tstamp_type_t system_clock_type, const snd_htimestamp_t* start_time)
++{
++	       return snd_pcm_start_at(pcm, SNDRV_PCM_CLOCK_CLASS_SYSTEM, system_clock_type, start_time);
++}
++
++/**
++ * \brief Start a PCM at a future time, according to a audio clock
++ * \param pcm PCM handle
++ * \param audio_clock_type Specifies the audio clock with which to interpret \p start_time
++ * \param start_time Absolute time at which to start the stream
++ * \return 0 on success otherwise a negative error code
++ * \retval -ENOSYS operation not supported for the current timestamp type
++ * \retval -EINPROGRESS start_at timer is already active
++ * \retval -EINVAL timespec, tstamp_class or tstamp_type is invalid
++ * \retval -ETIME requested start_time cannot be satisfied
++ *
++ * This method is non-blocking: It establishes an appropriate timer in the kernel
++ * that will start the stream on expiry. The stream moves to #SND_PCM_STATE_STARTING
++ * Use #snd_pcm_drop() to abort and return to #SND_PCM_STATE_SETUP.
++ */
++int snd_pcm_start_at_audio(snd_pcm_t *pcm, snd_pcm_audio_tstamp_type_t audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	       return snd_pcm_start_at(pcm, SNDRV_PCM_CLOCK_CLASS_AUDIO, audio_clock_type, start_time);
++}
++
++
+ /**
+  * \brief Stop a PCM dropping pending frames
+  * \param pcm PCM handle
+@@ -1510,6 +1578,7 @@ static const char *const snd_pcm_state_names[] = {
+ 	STATE(PAUSED),
+ 	STATE(SUSPENDED),
+ 	STATE(DISCONNECTED),
++	STATE(STARTING),
+ };
+ 
+ static const char *const snd_pcm_access_names[] = {
+@@ -6830,6 +6899,7 @@ snd_pcm_sframes_t snd_pcm_read_areas(snd_pcm_t *pcm, const snd_pcm_channel_area_
+ 				goto _end;
+ 			break;
+ 		case SND_PCM_STATE_RUNNING:
++		case SND_PCM_STATE_STARTING:
+ 			err = snd_pcm_hwsync(pcm);
+ 			if (err < 0)
+ 				goto _end;
+@@ -6907,9 +6977,12 @@ snd_pcm_sframes_t snd_pcm_write_areas(snd_pcm_t *pcm, const snd_pcm_channel_area
+ 		case SND_PCM_STATE_PAUSED:
+ 			break;
+ 		case SND_PCM_STATE_RUNNING:
++		case SND_PCM_STATE_STARTING:
+ 			err = snd_pcm_hwsync(pcm);
+-			if (err < 0)
++			if (err < 0) {
++				printf("snd_pcm_write_areas _again state %u err %d\n", (unsigned int)state, (int)err);
+ 				goto _end;
++			}
+ 			break;
+ 		case SND_PCM_STATE_XRUN:
+ 			err = -EPIPE;
+@@ -6926,20 +6999,24 @@ snd_pcm_sframes_t snd_pcm_write_areas(snd_pcm_t *pcm, const snd_pcm_channel_area
+ 		}
+ 		avail = snd_pcm_avail_update(pcm);
+ 		if (avail < 0) {
++			printf("snd_pcm_write_areas snd_pcm_avail_update err %d\n", (int)err);
+ 			err = avail;
+ 			goto _end;
+ 		}
+-		if ((state == SND_PCM_STATE_RUNNING &&
++		if (((state == SND_PCM_STATE_RUNNING) || (state == SND_PCM_STATE_STARTING)) &&
+ 		     size > (snd_pcm_uframes_t)avail &&
+-		     snd_pcm_may_wait_for_avail_min(pcm, avail))) {
++		     snd_pcm_may_wait_for_avail_min(pcm, avail)) {
+ 			if (pcm->mode & SND_PCM_NONBLOCK) {
+ 				err = -EAGAIN;
+ 				goto _end;
+ 			}
+ 
+ 			err = snd_pcm_wait_nocheck(pcm, -1);
+-			if (err < 0)
++			if (err < 0) {
++				printf("snd_pcm_write_areas snd_pcm_wait_nocheck err %d\n", (int)err);
+ 				break;
++			}
++
+ 			goto _again;			
+ 		}
+ 		frames = size;
+@@ -6948,8 +7025,10 @@ snd_pcm_sframes_t snd_pcm_write_areas(snd_pcm_t *pcm, const snd_pcm_channel_area
+ 		if (! frames)
+ 			break;
+ 		err = func(pcm, areas, offset, frames);
+-		if (err < 0)
++		if (err < 0) {
++			printf("snd_pcm_write_areas func err %d\n", (int)err);
+ 			break;
++		}
+ 		frames = err;
+ 		if (state == SND_PCM_STATE_PREPARED) {
+ 			snd_pcm_sframes_t hw_avail = pcm->buffer_size - avail;
+@@ -6959,8 +7038,10 @@ snd_pcm_sframes_t snd_pcm_write_areas(snd_pcm_t *pcm, const snd_pcm_channel_area
+ 			if (state == SND_PCM_STATE_PREPARED &&
+ 			    hw_avail >= (snd_pcm_sframes_t) pcm->start_threshold) {
+ 				err = snd_pcm_start(pcm);
+-				if (err < 0)
++				if (err < 0) {
++					printf("snd_pcm_write_areas snd_pcm_start err %d\n", (int)err);
+ 					goto _end;
++				}
+ 			}
+ 		}
+ 		offset += frames;
+diff --git a/src/pcm/pcm_dmix.c b/src/pcm/pcm_dmix.c
+index b26a5c7..9292e16 100644
+--- a/src/pcm/pcm_dmix.c
++++ b/src/pcm/pcm_dmix.c
+@@ -412,7 +412,8 @@ static int snd_pcm_dmix_sync_ptr(snd_pcm_t *pcm)
+ 	if (diff == 0)		/* fast path */
+ 		return 0;
+ 	if (dmix->state != SND_PCM_STATE_RUNNING &&
+-	    dmix->state != SND_PCM_STATE_DRAINING)
++	    dmix->state != SND_PCM_STATE_DRAINING &&
++	    dmix->state != SND_PCM_STATE_STARTING)
+ 		/* not really started yet - don't update hw_ptr */
+ 		return 0;
+ 	if (diff < 0) {
+@@ -429,7 +430,8 @@ static int snd_pcm_dmix_sync_ptr(snd_pcm_t *pcm)
+ 	if (avail >= pcm->stop_threshold) {
+ 		snd_timer_stop(dmix->timer);
+ 		gettimestamp(&dmix->trigger_tstamp, pcm->tstamp_type);
+-		if (dmix->state == SND_PCM_STATE_RUNNING) {
++		if (dmix->state == SND_PCM_STATE_RUNNING ||
++		    dmix->state == SND_PCM_STATE_STARTING) {
+ 			dmix->state = SND_PCM_STATE_XRUN;
+ 			return -EPIPE;
+ 		}
+@@ -470,6 +472,7 @@ static int snd_pcm_dmix_status(snd_pcm_t *pcm, snd_pcm_status_t * status)
+ 	switch (dmix->state) {
+ 	case SNDRV_PCM_STATE_DRAINING:
+ 	case SNDRV_PCM_STATE_RUNNING:
++	case SNDRV_PCM_STATE_STARTING:
+ 		snd_pcm_dmix_sync_ptr(pcm);
+ 		break;
+ 	default:
+@@ -494,6 +497,7 @@ static int snd_pcm_dmix_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp)
+ 	switch(dmix->state) {
+ 	case SNDRV_PCM_STATE_DRAINING:
+ 	case SNDRV_PCM_STATE_RUNNING:
++	case SNDRV_PCM_STATE_STARTING:
+ 		err = snd_pcm_dmix_sync_ptr(pcm);
+ 		if (err < 0)
+ 			return err;
+@@ -519,6 +523,7 @@ static int snd_pcm_dmix_hwsync(snd_pcm_t *pcm)
+ 	switch(dmix->state) {
+ 	case SNDRV_PCM_STATE_DRAINING:
+ 	case SNDRV_PCM_STATE_RUNNING:
++	case SNDRV_PCM_STATE_STARTING:
+ 		/* sync slave PCM */
+ 		return snd_pcm_dmix_sync_ptr(pcm);
+ 	case SNDRV_PCM_STATE_PREPARED:
+@@ -591,6 +596,16 @@ static int snd_pcm_dmix_start(snd_pcm_t *pcm)
+ 	return 0;
+ }
+ 
++int snd_pcm_dmix_start_at(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_direct_t *dmix = pcm->private_data;
++
++	if(clock_class == SNDRV_PCM_CLOCK_CLASS_SYSTEM)
++		return snd_pcm_start_at_system(dmix->spcm, audio_clock_type, start_time);
++	else
++		return snd_pcm_start_at_audio(dmix->spcm, audio_clock_type, start_time);
++}
++
+ static int snd_pcm_dmix_drop(snd_pcm_t *pcm)
+ {
+ 	snd_pcm_direct_t *dmix = pcm->private_data;
+@@ -678,7 +693,9 @@ static snd_pcm_sframes_t snd_pcm_dmix_rewind(snd_pcm_t *pcm, snd_pcm_uframes_t f
+ 	const snd_pcm_channel_area_t *src_areas, *dst_areas;
+ 
+ 	if (dmix->state == SND_PCM_STATE_RUNNING ||
+-	    dmix->state == SND_PCM_STATE_DRAINING) {
++	    dmix->state == SND_PCM_STATE_DRAINING ||
++	    dmix->state == SND_PCM_STATE_STARTING) {
++
+ 		err = snd_pcm_dmix_hwsync(pcm);
+ 		if (err < 0)
+ 			return err;
+@@ -819,10 +836,13 @@ static snd_pcm_sframes_t snd_pcm_dmix_mmap_commit(snd_pcm_t *pcm,
+ 		if ((err = snd_pcm_dmix_start_timer(pcm, dmix)) < 0)
+ 			return err;
+ 	} else if (dmix->state == SND_PCM_STATE_RUNNING ||
+-		   dmix->state == SND_PCM_STATE_DRAINING)
++		   dmix->state == SND_PCM_STATE_DRAINING ||
++		   dmix->state == SND_PCM_STATE_STARTING)
++
+ 		snd_pcm_dmix_sync_ptr(pcm);
+ 	if (dmix->state == SND_PCM_STATE_RUNNING ||
+-	    dmix->state == SND_PCM_STATE_DRAINING) {
++	    dmix->state == SND_PCM_STATE_DRAINING ||
++	    dmix->state == SND_PCM_STATE_STARTING) {
+ 		/* ok, we commit the changes after the validation of area */
+ 		/* it's intended, although the result might be crappy */
+ 		snd_pcm_dmix_sync_area(pcm);
+@@ -838,7 +858,8 @@ static snd_pcm_sframes_t snd_pcm_dmix_avail_update(snd_pcm_t *pcm)
+ 	snd_pcm_direct_t *dmix = pcm->private_data;
+ 	
+ 	if (dmix->state == SND_PCM_STATE_RUNNING ||
+-	    dmix->state == SND_PCM_STATE_DRAINING)
++	    dmix->state == SND_PCM_STATE_DRAINING ||
++	    dmix->state == SND_PCM_STATE_STARTING)
+ 		snd_pcm_dmix_sync_ptr(pcm);
+ 	return snd_pcm_mmap_playback_avail(pcm);
+ }
+@@ -853,7 +874,8 @@ static int snd_pcm_dmix_htimestamp(snd_pcm_t *pcm,
+ 	
+ 	while (1) {
+ 		if (dmix->state == SND_PCM_STATE_RUNNING ||
+-		    dmix->state == SND_PCM_STATE_DRAINING)
++		    dmix->state == SND_PCM_STATE_DRAINING ||
++		    dmix->state != SND_PCM_STATE_STARTING)
+ 			snd_pcm_dmix_sync_ptr(pcm);
+ 		avail1 = snd_pcm_mmap_playback_avail(pcm);
+ 		if (ok && *avail == avail1)
+@@ -868,7 +890,8 @@ static int snd_pcm_dmix_htimestamp(snd_pcm_t *pcm,
+ static int snd_pcm_dmix_poll_revents(snd_pcm_t *pcm, struct pollfd *pfds, unsigned int nfds, unsigned short *revents)
+ {
+ 	snd_pcm_direct_t *dmix = pcm->private_data;
+-	if (dmix->state == SND_PCM_STATE_RUNNING)
++	if (dmix->state == SND_PCM_STATE_RUNNING ||
++	    dmix->state == SND_PCM_STATE_STARTING)
+ 		snd_pcm_dmix_sync_area(pcm);
+ 	return snd_pcm_direct_poll_revents(pcm, pfds, nfds, revents);
+ }
+@@ -913,6 +936,7 @@ static const snd_pcm_fast_ops_t snd_pcm_dmix_fast_ops = {
+ 	.prepare = snd_pcm_direct_prepare,
+ 	.reset = snd_pcm_dmix_reset,
+ 	.start = snd_pcm_dmix_start,
++	.start_at = snd_pcm_dmix_start_at,
+ 	.drop = snd_pcm_dmix_drop,
+ 	.drain = snd_pcm_dmix_drain,
+ 	.pause = snd_pcm_dmix_pause,
+diff --git a/src/pcm/pcm_dshare.c b/src/pcm/pcm_dshare.c
+index 58e47bb..c01427e 100644
+--- a/src/pcm/pcm_dshare.c
++++ b/src/pcm/pcm_dshare.c
+@@ -178,7 +178,8 @@ static int snd_pcm_dshare_sync_ptr(snd_pcm_t *pcm)
+ 	if (diff == 0)		/* fast path */
+ 		return 0;
+ 	if (dshare->state != SND_PCM_STATE_RUNNING &&
+-	    dshare->state != SND_PCM_STATE_DRAINING)
++	    dshare->state != SND_PCM_STATE_DRAINING &&
++	    dshare->state != SND_PCM_STATE_STARTING)
+ 		/* not really started yet - don't update hw_ptr */
+ 		return 0;
+ 	if (diff < 0) {
+@@ -196,7 +197,8 @@ static int snd_pcm_dshare_sync_ptr(snd_pcm_t *pcm)
+ 	if (avail >= pcm->stop_threshold) {
+ 		snd_timer_stop(dshare->timer);
+ 		gettimestamp(&dshare->trigger_tstamp, pcm->tstamp_type);
+-		if (dshare->state == SND_PCM_STATE_RUNNING) {
++		if (dshare->state == SND_PCM_STATE_RUNNING ||
++		    dshare->state == SND_PCM_STATE_STARTING) {
+ 			dshare->state = SND_PCM_STATE_XRUN;
+ 			return -EPIPE;
+ 		}
+@@ -218,6 +220,7 @@ static int snd_pcm_dshare_status(snd_pcm_t *pcm, snd_pcm_status_t * status)
+ 	switch (dshare->state) {
+ 	case SNDRV_PCM_STATE_DRAINING:
+ 	case SNDRV_PCM_STATE_RUNNING:
++	case SNDRV_PCM_STATE_STARTING:
+ 		snd_pcm_dshare_sync_ptr(pcm);
+ 		break;
+ 	default:
+@@ -261,6 +264,7 @@ static int snd_pcm_dshare_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp)
+ 	switch (dshare->state) {
+ 	case SNDRV_PCM_STATE_DRAINING:
+ 	case SNDRV_PCM_STATE_RUNNING:
++	case SNDRV_PCM_STATE_STARTING:
+ 		err = snd_pcm_dshare_sync_ptr(pcm);
+ 		if (err < 0)
+ 			return err;
+@@ -286,6 +290,7 @@ static int snd_pcm_dshare_hwsync(snd_pcm_t *pcm)
+ 	switch(dshare->state) {
+ 	case SNDRV_PCM_STATE_DRAINING:
+ 	case SNDRV_PCM_STATE_RUNNING:
++	case SNDRV_PCM_STATE_STARTING:
+ 		return snd_pcm_dshare_sync_ptr(pcm);
+ 	case SNDRV_PCM_STATE_PREPARED:
+ 	case SNDRV_PCM_STATE_SUSPENDED:
+@@ -343,6 +348,17 @@ static int snd_pcm_dshare_start(snd_pcm_t *pcm)
+ 	return 0;
+ }
+ 
++int snd_pcm_dshare_start_at(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_direct_t *dshare = pcm->private_data;
++
++	if(clock_class == SNDRV_PCM_CLOCK_CLASS_SYSTEM)
++		return snd_pcm_start_at_system(dshare->spcm, audio_clock_type, start_time);
++	else
++		return snd_pcm_start_at_audio(dshare->spcm, audio_clock_type, start_time);
++}
++
++
+ static int snd_pcm_dshare_drop(snd_pcm_t *pcm)
+ {
+ 	snd_pcm_direct_t *dshare = pcm->private_data;
+@@ -506,10 +522,12 @@ static snd_pcm_sframes_t snd_pcm_dshare_mmap_commit(snd_pcm_t *pcm,
+ 		if ((err = snd_pcm_dshare_start_timer(dshare)) < 0)
+ 			return err;
+ 	} else if (dshare->state == SND_PCM_STATE_RUNNING ||
+-		   dshare->state == SND_PCM_STATE_DRAINING)
++		   dshare->state == SND_PCM_STATE_DRAINING ||
++		   dshare->state == SND_PCM_STATE_STARTING)
+ 		snd_pcm_dshare_sync_ptr(pcm);
+ 	if (dshare->state == SND_PCM_STATE_RUNNING ||
+-	    dshare->state == SND_PCM_STATE_DRAINING) {
++	    dshare->state == SND_PCM_STATE_DRAINING ||
++	    dshare->state == SND_PCM_STATE_STARTING) {
+ 		/* ok, we commit the changes after the validation of area */
+ 		/* it's intended, although the result might be crappy */
+ 		snd_pcm_dshare_sync_area(pcm);
+@@ -525,7 +543,8 @@ static snd_pcm_sframes_t snd_pcm_dshare_avail_update(snd_pcm_t *pcm)
+ 	snd_pcm_direct_t *dshare = pcm->private_data;
+ 	
+ 	if (dshare->state == SND_PCM_STATE_RUNNING ||
+-	    dshare->state == SND_PCM_STATE_DRAINING)
++	    dshare->state == SND_PCM_STATE_DRAINING ||
++	    dshare->state == SND_PCM_STATE_STARTING)
+ 		snd_pcm_dshare_sync_ptr(pcm);
+ 	return snd_pcm_mmap_playback_avail(pcm);
+ }
+@@ -540,7 +559,8 @@ static int snd_pcm_dshare_htimestamp(snd_pcm_t *pcm,
+ 	
+ 	while (1) {
+ 		if (dshare->state == SND_PCM_STATE_RUNNING ||
+-		    dshare->state == SND_PCM_STATE_DRAINING)
++		    dshare->state == SND_PCM_STATE_DRAINING ||
++		    dshare->state == SND_PCM_STATE_STARTING)
+ 			snd_pcm_dshare_sync_ptr(pcm);
+ 		avail1 = snd_pcm_mmap_playback_avail(pcm);
+ 		if (ok && *avail == avail1)
+@@ -590,6 +610,7 @@ static const snd_pcm_fast_ops_t snd_pcm_dshare_fast_ops = {
+ 	.prepare = snd_pcm_direct_prepare,
+ 	.reset = snd_pcm_dshare_reset,
+ 	.start = snd_pcm_dshare_start,
++	.start_at = snd_pcm_dshare_start_at,
+ 	.drop = snd_pcm_dshare_drop,
+ 	.drain = snd_pcm_dshare_drain,
+ 	.pause = snd_pcm_dshare_pause,
+diff --git a/src/pcm/pcm_dsnoop.c b/src/pcm/pcm_dsnoop.c
+index 576c35b..44fef0d 100644
+--- a/src/pcm/pcm_dsnoop.c
++++ b/src/pcm/pcm_dsnoop.c
+@@ -181,6 +181,7 @@ static int snd_pcm_dsnoop_status(snd_pcm_t *pcm, snd_pcm_status_t * status)
+ 	switch(dsnoop->state) {
+ 	case SNDRV_PCM_STATE_DRAINING:
+ 	case SNDRV_PCM_STATE_RUNNING:
++	case SNDRV_PCM_STATE_STARTING:
+ 		snd_pcm_dsnoop_sync_ptr(pcm);
+ 		break;
+ 	default:
+@@ -189,7 +190,7 @@ static int snd_pcm_dsnoop_status(snd_pcm_t *pcm, snd_pcm_status_t * status)
+ 	memset(status, 0, sizeof(*status));
+ 	snd_pcm_status(dsnoop->spcm, status);
+ 	state = snd_pcm_state(dsnoop->spcm);
+-	status->state = state == SND_PCM_STATE_RUNNING ? dsnoop->state : state;
++	status->state = ((state == SND_PCM_STATE_RUNNING) || (state == SND_PCM_STATE_STARTING)) ? dsnoop->state : state;
+ 	status->trigger_tstamp = dsnoop->trigger_tstamp;
+ 	status->avail = snd_pcm_mmap_capture_avail(pcm);
+ 	status->avail_max = status->avail > dsnoop->avail_max ? status->avail : dsnoop->avail_max;
+@@ -223,6 +224,7 @@ static int snd_pcm_dsnoop_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp)
+ 	switch(dsnoop->state) {
+ 	case SNDRV_PCM_STATE_DRAINING:
+ 	case SNDRV_PCM_STATE_RUNNING:
++	case SNDRV_PCM_STATE_STARTING:
+ 		err = snd_pcm_dsnoop_sync_ptr(pcm);
+ 		if (err < 0)
+ 			return err;
+@@ -247,6 +249,7 @@ static int snd_pcm_dsnoop_hwsync(snd_pcm_t *pcm)
+ 	switch(dsnoop->state) {
+ 	case SNDRV_PCM_STATE_DRAINING:
+ 	case SNDRV_PCM_STATE_RUNNING:
++	case SNDRV_PCM_STATE_STARTING:
+ 		return snd_pcm_dsnoop_sync_ptr(pcm);
+ 	case SNDRV_PCM_STATE_PREPARED:
+ 	case SNDRV_PCM_STATE_SUSPENDED:
+@@ -287,6 +290,21 @@ static int snd_pcm_dsnoop_start(snd_pcm_t *pcm)
+ 	return 0;
+ }
+ 
++int snd_pcm_dsnoop_start_at(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_direct_t *dsnoop = pcm->private_data;
++	int ret;
++
++	if(clock_class == SNDRV_PCM_CLOCK_CLASS_SYSTEM)
++		ret = snd_pcm_start_at_system(dsnoop->spcm, audio_clock_type, start_time);
++	else
++		ret = snd_pcm_start_at_audio(dsnoop->spcm, audio_clock_type, start_time);
++
++	if(ret == 0)
++		dsnoop->state = SND_PCM_STATE_STARTING;
++}
++
++
+ static int snd_pcm_dsnoop_drop(snd_pcm_t *pcm)
+ {
+ 	snd_pcm_direct_t *dsnoop = pcm->private_data;
+@@ -308,7 +326,8 @@ static int snd_pcm_dsnoop_drain(snd_pcm_t *pcm)
+ 	stop_threshold = pcm->stop_threshold;
+ 	if (pcm->stop_threshold > pcm->buffer_size)
+ 		pcm->stop_threshold = pcm->buffer_size;
+-	while (dsnoop->state == SND_PCM_STATE_RUNNING) {
++	while (dsnoop->state == SND_PCM_STATE_RUNNING ||
++	        dsnoop->state == SND_PCM_STATE_STARTING) {
+ 		err = snd_pcm_dsnoop_sync_ptr(pcm);
+ 		if (err < 0)
+ 			break;
+@@ -405,7 +424,8 @@ static snd_pcm_sframes_t snd_pcm_dsnoop_mmap_commit(snd_pcm_t *pcm,
+ 	default:
+ 		break;
+ 	}
+-	if (dsnoop->state == SND_PCM_STATE_RUNNING) {
++	if (dsnoop->state == SND_PCM_STATE_RUNNING ||
++	    dsnoop->state == SND_PCM_STATE_STARTING) {
+ 		err = snd_pcm_dsnoop_sync_ptr(pcm);
+ 		if (err < 0)
+ 			return err;
+@@ -422,7 +442,8 @@ static snd_pcm_sframes_t snd_pcm_dsnoop_avail_update(snd_pcm_t *pcm)
+ 	snd_pcm_direct_t *dsnoop = pcm->private_data;
+ 	int err;
+ 	
+-	if (dsnoop->state == SND_PCM_STATE_RUNNING) {
++	if (dsnoop->state == SND_PCM_STATE_RUNNING ||
++	    dsnoop->state == SND_PCM_STATE_STARTING) {
+ 		err = snd_pcm_dsnoop_sync_ptr(pcm);
+ 		if (err < 0)
+ 			return err;
+@@ -440,7 +461,8 @@ static int snd_pcm_dsnoop_htimestamp(snd_pcm_t *pcm,
+ 	
+ 	while (1) {
+ 		if (dsnoop->state == SND_PCM_STATE_RUNNING ||
+-		    dsnoop->state == SND_PCM_STATE_DRAINING)
++		    dsnoop->state == SND_PCM_STATE_DRAINING ||
++		    dsnoop->state == SND_PCM_STATE_STARTING)
+ 			snd_pcm_dsnoop_sync_ptr(pcm);
+ 		avail1 = snd_pcm_mmap_capture_avail(pcm);
+ 		if (ok && *avail == avail1)
+@@ -491,6 +513,7 @@ static const snd_pcm_fast_ops_t snd_pcm_dsnoop_fast_ops = {
+ 	.prepare = snd_pcm_direct_prepare,
+ 	.reset = snd_pcm_dsnoop_reset,
+ 	.start = snd_pcm_dsnoop_start,
++	.start_at = snd_pcm_dsnoop_start_at,
+ 	.drop = snd_pcm_dsnoop_drop,
+ 	.drain = snd_pcm_dsnoop_drain,
+ 	.pause = snd_pcm_dsnoop_pause,
+diff --git a/src/pcm/pcm_file.c b/src/pcm/pcm_file.c
+index 92eb072..d7b6f91 100644
+--- a/src/pcm/pcm_file.c
++++ b/src/pcm/pcm_file.c
+@@ -669,6 +669,17 @@ static const snd_pcm_ops_t snd_pcm_file_ops = {
+ 	.set_chmap = snd_pcm_generic_set_chmap,
+ };
+ 
++int snd_pcm_file_start_at(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_generic_t *generic = pcm->private_data;
++
++	if(clock_class == SNDRV_PCM_CLOCK_CLASS_SYSTEM)
++		return snd_pcm_start_at_system(generic->slave, audio_clock_type, start_time);
++	else
++		return snd_pcm_start_at_audio(generic->slave, audio_clock_type, start_time);
++}
++
++
+ static const snd_pcm_fast_ops_t snd_pcm_file_fast_ops = {
+ 	.status = snd_pcm_generic_status,
+ 	.state = snd_pcm_generic_state,
+@@ -677,6 +688,7 @@ static const snd_pcm_fast_ops_t snd_pcm_file_fast_ops = {
+ 	.prepare = snd_pcm_generic_prepare,
+ 	.reset = snd_pcm_file_reset,
+ 	.start = snd_pcm_generic_start,
++	.start_at = snd_pcm_file_start_at,
+ 	.drop = snd_pcm_file_drop,
+ 	.drain = snd_pcm_file_drain,
+ 	.pause = snd_pcm_generic_pause,
+diff --git a/src/pcm/pcm_hooks.c b/src/pcm/pcm_hooks.c
+index ce1cf36..827dce2 100644
+--- a/src/pcm/pcm_hooks.c
++++ b/src/pcm/pcm_hooks.c
+@@ -170,6 +170,16 @@ static const snd_pcm_ops_t snd_pcm_hooks_ops = {
+ 	.set_chmap = snd_pcm_generic_set_chmap,
+ };
+ 
++int snd_pcm_hook_start_at(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_generic_t *generic = pcm->private_data;
++
++	if(clock_class == SNDRV_PCM_CLOCK_CLASS_SYSTEM)
++		return snd_pcm_start_at_system(generic->slave, audio_clock_type, start_time);
++	else
++		return snd_pcm_start_at_audio(generic->slave, audio_clock_type, start_time);
++}
++
+ static const snd_pcm_fast_ops_t snd_pcm_hooks_fast_ops = {
+ 	.status = snd_pcm_generic_status,
+ 	.state = snd_pcm_generic_state,
+@@ -178,6 +188,7 @@ static const snd_pcm_fast_ops_t snd_pcm_hooks_fast_ops = {
+ 	.prepare = snd_pcm_generic_prepare,
+ 	.reset = snd_pcm_generic_reset,
+ 	.start = snd_pcm_generic_start,
++	.start_at = snd_pcm_hook_start_at,
+ 	.drop = snd_pcm_generic_drop,
+ 	.drain = snd_pcm_generic_drain,
+ 	.pause = snd_pcm_generic_pause,
+diff --git a/src/pcm/pcm_hw.c b/src/pcm/pcm_hw.c
+index 4f4b84b..0842535 100644
+--- a/src/pcm/pcm_hw.c
++++ b/src/pcm/pcm_hw.c
+@@ -627,6 +627,25 @@ static int snd_pcm_hw_start(snd_pcm_t *pcm)
+ 	return 0;
+ }
+ 
++static int snd_pcm_hw_start_at(snd_pcm_t *pcm, int clock_class, int clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_hw_t *hw = pcm->private_data;
++	int err;
++
++	struct snd_startat startat_operation = {
++		.clock_class = clock_class,
++		.clock_type = clock_type,
++		.start_time = *start_time,
++	};
++
++	if (ioctl(hw->fd, SNDRV_PCM_IOCTL_START_AT, &startat_operation) < 0) {
++		err = -errno;
++		SYSMSG("SNDRV_PCM_IOCTL_START_AT failed (%i)", err);
++		return err;
++	}
++	return 0;
++}
++
+ static int snd_pcm_hw_drop(snd_pcm_t *pcm)
+ {
+ 	snd_pcm_hw_t *hw = pcm->private_data;
+@@ -714,6 +733,7 @@ static snd_pcm_sframes_t snd_pcm_hw_forward(snd_pcm_t *pcm, snd_pcm_uframes_t fr
+ 		case SNDRV_PCM_STATE_DRAINING:
+ 		case SNDRV_PCM_STATE_PAUSED:
+ 		case SNDRV_PCM_STATE_PREPARED:
++		case SNDRV_PCM_STATE_STARTING:
+ 			break;
+ 		case SNDRV_PCM_STATE_XRUN:
+ 			return -EPIPE;
+@@ -999,6 +1019,7 @@ static snd_pcm_sframes_t snd_pcm_hw_avail_update(snd_pcm_t *pcm)
+ 	avail = snd_pcm_mmap_avail(pcm);
+ 	switch (FAST_PCM_STATE(hw)) {
+ 	case SNDRV_PCM_STATE_RUNNING:
++	case SNDRV_PCM_STATE_STARTING:
+ 		if (avail >= pcm->stop_threshold) {
+ 			/* SNDRV_PCM_IOCTL_XRUN ioctl has been implemented since PCM kernel API 2.0.1 */
+ 			if (SNDRV_PROTOCOL_VERSION(2, 0, 1) <= hw->version) {
+@@ -1209,6 +1230,7 @@ static snd_pcm_chmap_t *snd_pcm_hw_get_chmap(snd_pcm_t *pcm)
+ 	switch (FAST_PCM_STATE(hw)) {
+ 	case SNDRV_PCM_STATE_PREPARED:
+ 	case SNDRV_PCM_STATE_RUNNING:
++	case SNDRV_PCM_STATE_STARTING:
+ 	case SNDRV_PCM_STATE_XRUN:
+ 	case SNDRV_PCM_STATE_DRAINING:
+ 	case SNDRV_PCM_STATE_PAUSED:
+@@ -1343,6 +1365,7 @@ static const snd_pcm_fast_ops_t snd_pcm_hw_fast_ops = {
+ 	.prepare = snd_pcm_hw_prepare,
+ 	.reset = snd_pcm_hw_reset,
+ 	.start = snd_pcm_hw_start,
++	.start_at = snd_pcm_hw_start_at,
+ 	.drop = snd_pcm_hw_drop,
+ 	.drain = snd_pcm_hw_drain,
+ 	.pause = snd_pcm_hw_pause,
+@@ -1374,6 +1397,7 @@ static const snd_pcm_fast_ops_t snd_pcm_hw_fast_ops_timer = {
+ 	.prepare = snd_pcm_hw_prepare,
+ 	.reset = snd_pcm_hw_reset,
+ 	.start = snd_pcm_hw_start,
++	.start_at = snd_pcm_hw_start_at,
+ 	.drop = snd_pcm_hw_drop,
+ 	.drain = snd_pcm_hw_drain,
+ 	.pause = snd_pcm_hw_pause,
+diff --git a/src/pcm/pcm_local.h b/src/pcm/pcm_local.h
+index 326618e..6851204 100644
+--- a/src/pcm/pcm_local.h
++++ b/src/pcm/pcm_local.h
+@@ -154,6 +154,7 @@ typedef struct {
+ 	int (*prepare)(snd_pcm_t *pcm);
+ 	int (*reset)(snd_pcm_t *pcm);
+ 	int (*start)(snd_pcm_t *pcm);
++	int (*start_at)(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time);
+ 	int (*drop)(snd_pcm_t *pcm);
+ 	int (*drain)(snd_pcm_t *pcm);
+ 	int (*pause)(snd_pcm_t *pcm, int enable);
+@@ -482,8 +483,10 @@ static inline snd_pcm_uframes_t snd_pcm_mmap_hw_rewindable(snd_pcm_t *pcm)
+ 
+ static inline const snd_pcm_channel_area_t *snd_pcm_mmap_areas(snd_pcm_t *pcm)
+ {
++	snd_pcm_state_t state = snd_pcm_state(pcm);
+ 	if (pcm->stopped_areas &&
+-	    snd_pcm_state(pcm) != SND_PCM_STATE_RUNNING) 
++	    state != SND_PCM_STATE_RUNNING &&
++	    state != SND_PCM_STATE_STARTING)
+ 		return pcm->stopped_areas;
+ 	return pcm->running_areas;
+ }
+diff --git a/src/pcm/pcm_meter.c b/src/pcm/pcm_meter.c
+index 1b0ccb4..4ee0c33 100644
+--- a/src/pcm/pcm_meter.c
++++ b/src/pcm/pcm_meter.c
+@@ -201,6 +201,7 @@ static void *snd_pcm_meter_thread(void *data)
+ 		err = snd_pcm_status(spcm, &status);
+ 		assert(err >= 0);
+ 		if (status.state != SND_PCM_STATE_RUNNING &&
++		    status.state != SND_PCM_STATE_STARTING &&
+ 		    (status.state != SND_PCM_STATE_DRAINING ||
+ 		     spcm->stream != SND_PCM_STREAM_PLAYBACK)) {
+ 			if (meter->running) {
+@@ -325,6 +326,16 @@ static int snd_pcm_meter_start(snd_pcm_t *pcm)
+ 	return err;
+ }
+ 
++int snd_pcm_meter_start_at(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_meter_t *meter = pcm->private_data;
++
++	if(clock_class == SNDRV_PCM_CLOCK_CLASS_SYSTEM)
++		return snd_pcm_start_at_system(meter->gen.slave, audio_clock_type, start_time);
++	else
++		return snd_pcm_start_at_audio(meter->gen.slave, audio_clock_type, start_time);
++}
++
+ static snd_pcm_sframes_t snd_pcm_meter_rewind(snd_pcm_t *pcm, snd_pcm_uframes_t frames)
+ {
+ 	snd_pcm_meter_t *meter = pcm->private_data;
+@@ -530,6 +541,7 @@ static const snd_pcm_fast_ops_t snd_pcm_meter_fast_ops = {
+ 	.prepare = snd_pcm_meter_prepare,
+ 	.reset = snd_pcm_meter_reset,
+ 	.start = snd_pcm_meter_start,
++	.start_at = snd_pcm_meter_start_at,
+ 	.drop = snd_pcm_generic_drop,
+ 	.drain = snd_pcm_generic_drain,
+ 	.pause = snd_pcm_generic_pause,
+diff --git a/src/pcm/pcm_mmap.c b/src/pcm/pcm_mmap.c
+index 5c4fbe1..caf4284 100644
+--- a/src/pcm/pcm_mmap.c
++++ b/src/pcm/pcm_mmap.c
+@@ -136,7 +136,7 @@ static snd_pcm_sframes_t snd_pcm_mmap_read_areas(snd_pcm_t *pcm,
+  * \param size frames to be written
+  * \return a positive number of frames actually written otherwise a
+  * negative error code
+- * \retval -EBADFD PCM is not in the right state (#SND_PCM_STATE_PREPARED or #SND_PCM_STATE_RUNNING)
++ * \retval -EBADFD PCM is not in the right state (#SND_PCM_STATE_PREPARED or #SND_PCM_STATE_RUNNING or #SND_PCM_STATE_STARTING)
+  * \retval -EPIPE an underrun occurred
+  * \retval -ESTRPIPE a suspend event occurred (stream is suspended and waiting for an application recovery)
+  *
+@@ -161,7 +161,7 @@ snd_pcm_sframes_t snd_pcm_mmap_writei(snd_pcm_t *pcm, const void *buffer, snd_pc
+  * \param size frames to be written
+  * \return a positive number of frames actually written otherwise a
+  * negative error code
+- * \retval -EBADFD PCM is not in the right state (#SND_PCM_STATE_PREPARED or #SND_PCM_STATE_RUNNING)
++ * \retval -EBADFD PCM is not in the right state (#SND_PCM_STATE_PREPARED or #SND_PCM_STATE_RUNNING or #SND_PCM_STATE_STARTING)
+  * \retval -EPIPE an underrun occurred
+  * \retval -ESTRPIPE a suspend event occurred (stream is suspended and waiting for an application recovery)
+  *
+@@ -186,7 +186,7 @@ snd_pcm_sframes_t snd_pcm_mmap_writen(snd_pcm_t *pcm, void **bufs, snd_pcm_ufram
+  * \param size frames to be written
+  * \return a positive number of frames actually read otherwise a
+  * negative error code
+- * \retval -EBADFD PCM is not in the right state (#SND_PCM_STATE_PREPARED or #SND_PCM_STATE_RUNNING)
++ * \retval -EBADFD PCM is not in the right state (#SND_PCM_STATE_PREPARED or #SND_PCM_STATE_RUNNING or #SND_PCM_STATE_STARTING)
+  * \retval -EPIPE an overrun occurred
+  * \retval -ESTRPIPE a suspend event occurred (stream is suspended and waiting for an application recovery)
+  *
+@@ -211,7 +211,7 @@ snd_pcm_sframes_t snd_pcm_mmap_readi(snd_pcm_t *pcm, void *buffer, snd_pcm_ufram
+  * \param size frames to be written
+  * \return a positive number of frames actually read otherwise a
+  * negative error code
+- * \retval -EBADFD PCM is not in the right state (#SND_PCM_STATE_PREPARED or #SND_PCM_STATE_RUNNING)
++ * \retval -EBADFD PCM is not in the right state (#SND_PCM_STATE_PREPARED or #SND_PCM_STATE_RUNNING or #SND_PCM_STATE_STARTING)
+  * \retval -EPIPE an overrun occurred
+  * \retval -ESTRPIPE a suspend event occurred (stream is suspended and waiting for an application recovery)
+  *
+diff --git a/src/pcm/pcm_multi.c b/src/pcm/pcm_multi.c
+index c4b1fba..161df1a 100644
+--- a/src/pcm/pcm_multi.c
++++ b/src/pcm/pcm_multi.c
+@@ -490,6 +490,30 @@ static int snd_pcm_multi_start(snd_pcm_t *pcm)
+ 	return err;
+ }
+ 
++static int snd_pcm_multi_start_at(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_multi_t *multi = pcm->private_data;
++	int err = 0;
++	unsigned int i;
++	if (multi->slaves[0].linked) {
++		if(clock_class == SNDRV_PCM_CLOCK_CLASS_SYSTEM)
++			return snd_pcm_start_at_system(multi->slaves[0].linked, audio_clock_type, start_time);
++		else
++			return snd_pcm_start_at_audio(multi->slaves[0].linked, audio_clock_type, start_time);
++		}
++		for (i = 0; i < multi->slaves_count; ++i) {
++			if (multi->slaves[i].linked)
++				continue;
++			if(clock_class == SNDRV_PCM_CLOCK_CLASS_SYSTEM)
++				err = snd_pcm_start_at_system(multi->slaves[i].pcm, audio_clock_type, start_time);
++			else
++				err = snd_pcm_start_at_audio(multi->slaves[i].pcm, audio_clock_type, start_time);
++			if (err < 0)
++				return err;
++			}
++		return err;
++}
++
+ static int snd_pcm_multi_drop(snd_pcm_t *pcm)
+ {
+ 	snd_pcm_multi_t *multi = pcm->private_data;
+@@ -963,6 +987,7 @@ static const snd_pcm_fast_ops_t snd_pcm_multi_fast_ops = {
+ 	.prepare = snd_pcm_multi_prepare,
+ 	.reset = snd_pcm_multi_reset,
+ 	.start = snd_pcm_multi_start,
++	.start_at = snd_pcm_multi_start_at,
+ 	.drop = snd_pcm_multi_drop,
+ 	.drain = snd_pcm_multi_drain,
+ 	.pause = snd_pcm_multi_pause,
+diff --git a/src/pcm/pcm_null.c b/src/pcm/pcm_null.c
+index 685618e..880655c 100644
+--- a/src/pcm/pcm_null.c
++++ b/src/pcm/pcm_null.c
+@@ -145,6 +145,16 @@ static int snd_pcm_null_start(snd_pcm_t *pcm)
+ 	return 0;
+ }
+ 
++int snd_pcm_null_start_at(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_null_t *null = pcm->private_data;
++	assert(null->state == SND_PCM_STATE_PREPARED);
++	assert(pcm->stream == SND_PCM_STREAM_PLAYBACK);
++	null->state = SND_PCM_STATE_STARTING;
++	*pcm->hw.ptr = *pcm->appl.ptr;
++	return 0;
++}
++
+ static int snd_pcm_null_drop(snd_pcm_t *pcm)
+ {
+ 	snd_pcm_null_t *null = pcm->private_data;
+@@ -192,6 +202,7 @@ static snd_pcm_sframes_t snd_pcm_null_rewind(snd_pcm_t *pcm, snd_pcm_uframes_t f
+ 	snd_pcm_null_t *null = pcm->private_data;
+ 	switch (null->state) {
+ 	case SND_PCM_STATE_RUNNING:
++	case SND_PCM_STATE_STARTING:
+ 		snd_pcm_mmap_hw_backward(pcm, frames);
+ 		/* Fall through */
+ 	case SND_PCM_STATE_PREPARED:
+@@ -207,6 +218,7 @@ static snd_pcm_sframes_t snd_pcm_null_forward(snd_pcm_t *pcm, snd_pcm_uframes_t
+ 	snd_pcm_null_t *null = pcm->private_data;
+ 	switch (null->state) {
+ 	case SND_PCM_STATE_RUNNING:
++	case SND_PCM_STATE_STARTING:
+ 		snd_pcm_mmap_hw_forward(pcm, frames);
+ 		/* Fall through */
+ 	case SND_PCM_STATE_PREPARED:
+@@ -336,6 +348,7 @@ static const snd_pcm_fast_ops_t snd_pcm_null_fast_ops = {
+ 	.prepare = snd_pcm_null_prepare,
+ 	.reset = snd_pcm_null_reset,
+ 	.start = snd_pcm_null_start,
++	.start_at = snd_pcm_null_start_at,
+ 	.drop = snd_pcm_null_drop,
+ 	.drain = snd_pcm_null_drain,
+ 	.pause = snd_pcm_null_pause,
+diff --git a/src/pcm/pcm_plugin.c b/src/pcm/pcm_plugin.c
+index d007e8c..2c69060 100644
+--- a/src/pcm/pcm_plugin.c
++++ b/src/pcm/pcm_plugin.c
+@@ -540,6 +540,17 @@ static int snd_pcm_plugin_status(snd_pcm_t *pcm, snd_pcm_status_t * status)
+ 	return 0;
+ }
+ 
++int snd_pcm_plug_start_at(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_generic_t *generic = pcm->private_data;
++
++	if(clock_class == SNDRV_PCM_CLOCK_CLASS_SYSTEM)
++		return snd_pcm_start_at_system(generic->slave, audio_clock_type, start_time);
++	else
++		return snd_pcm_start_at_audio(generic->slave, audio_clock_type, start_time);
++}
++
++
+ const snd_pcm_fast_ops_t snd_pcm_plugin_fast_ops = {
+ 	.status = snd_pcm_plugin_status,
+ 	.state = snd_pcm_generic_state,
+@@ -548,6 +559,7 @@ const snd_pcm_fast_ops_t snd_pcm_plugin_fast_ops = {
+ 	.prepare = snd_pcm_plugin_prepare,
+ 	.reset = snd_pcm_plugin_reset,
+ 	.start = snd_pcm_generic_start,
++	.start_at = snd_pcm_plug_start_at,
+ 	.drop = snd_pcm_generic_drop,
+ 	.drain = snd_pcm_generic_drain,
+ 	.pause = snd_pcm_generic_pause,
+diff --git a/src/pcm/pcm_rate.c b/src/pcm/pcm_rate.c
+index 41bddac..ff94dab 100644
+--- a/src/pcm/pcm_rate.c
++++ b/src/pcm/pcm_rate.c
+@@ -1081,6 +1081,16 @@ static int snd_pcm_rate_start(snd_pcm_t *pcm)
+ 	return snd_pcm_start(rate->gen.slave);
+ }
+ 
++int snd_pcm_rate_start_at(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_rate_t *rate = pcm->private_data;
++
++	if(clock_class == SNDRV_PCM_CLOCK_CLASS_SYSTEM)
++		return snd_pcm_start_at_system(rate->gen.slave, audio_clock_type, start_time);
++	else
++		return snd_pcm_start_at_audio(rate->gen.slave, audio_clock_type, start_time);
++}
++
+ static int snd_pcm_rate_status(snd_pcm_t *pcm, snd_pcm_status_t * status)
+ {
+ 	snd_pcm_rate_t *rate = pcm->private_data;
+@@ -1158,6 +1168,7 @@ static const snd_pcm_fast_ops_t snd_pcm_rate_fast_ops = {
+ 	.prepare = snd_pcm_rate_prepare,
+ 	.reset = snd_pcm_rate_reset,
+ 	.start = snd_pcm_rate_start,
++	.start_at = snd_pcm_rate_start_at,
+ 	.drop = snd_pcm_generic_drop,
+ 	.drain = snd_pcm_rate_drain,
+ 	.pause = snd_pcm_generic_pause,
+diff --git a/src/pcm/pcm_share.c b/src/pcm/pcm_share.c
+index 5d8aaf2..ecc052a 100644
+--- a/src/pcm/pcm_share.c
++++ b/src/pcm/pcm_share.c
+@@ -151,6 +151,7 @@ static snd_pcm_uframes_t _snd_pcm_share_slave_forward(snd_pcm_share_slave_t *sla
+ 		snd_pcm_t *pcm = share->pcm;
+ 		switch (share->state) {
+ 		case SND_PCM_STATE_RUNNING:
++		case SND_PCM_STATE_STARTING:
+ 			break;
+ 		case SND_PCM_STATE_DRAINING:
+ 			if (pcm->stream != SND_PCM_STREAM_PLAYBACK)
+@@ -163,7 +164,8 @@ static snd_pcm_uframes_t _snd_pcm_share_slave_forward(snd_pcm_share_slave_t *sla
+ 		frames = slave_avail - avail;
+ 		if (frames > max_frames)
+ 			max_frames = frames;
+-		if (share->state != SND_PCM_STATE_RUNNING)
++		if (share->state != SND_PCM_STATE_RUNNING &&
++		    share->state != SND_PCM_STATE_STARTING)
+ 			continue;
+ 		if (frames < min_frames)
+ 			min_frames = frames;
+@@ -208,6 +210,7 @@ static snd_pcm_uframes_t _snd_pcm_share_missing(snd_pcm_t *pcm)
+ 	// printf("state=%s hw_ptr=%ld appl_ptr=%ld slave appl_ptr=%ld safety=%ld silence=%ld\n", snd_pcm_state_name(share->state), slave->hw_ptr, share->appl_ptr, *slave->pcm->appl_ptr, slave->safety_threshold, slave->silence_frames);
+ 	switch (share->state) {
+ 	case SND_PCM_STATE_RUNNING:
++	case SND_PCM_STATE_STARTING:
+ 		break;
+ 	case SND_PCM_STATE_DRAINING:
+ 		if (pcm->stream == SND_PCM_STREAM_PLAYBACK)
+@@ -264,6 +267,7 @@ static snd_pcm_uframes_t _snd_pcm_share_missing(snd_pcm_t *pcm)
+ 		}
+ 		break;
+ 	case SND_PCM_STATE_RUNNING:
++	case SND_PCM_STATE_STARTING:
+ 		if (avail >= pcm->stop_threshold) {
+ 			_snd_pcm_share_stop(pcm, SND_PCM_STATE_XRUN);
+ 			break;
+@@ -696,12 +700,14 @@ static int snd_pcm_share_status(snd_pcm_t *pcm, snd_pcm_status_t *status)
+ 	if (pcm->stream == SND_PCM_STREAM_PLAYBACK) {
+ 		status->avail = snd_pcm_mmap_playback_avail(pcm);
+ 		if (share->state != SND_PCM_STATE_RUNNING &&
+-		    share->state != SND_PCM_STATE_DRAINING)
++		    share->state != SND_PCM_STATE_DRAINING &&
++		    share->state != SND_PCM_STATE_STARTING)
+ 			goto _notrunning;
+ 		d = pcm->buffer_size - status->avail;
+ 	} else {
+ 		status->avail = snd_pcm_mmap_capture_avail(pcm);
+-		if (share->state != SND_PCM_STATE_RUNNING)
++		if (share->state != SND_PCM_STATE_RUNNING &&
++		    share->state != SND_PCM_STATE_STARTING)
+ 			goto _notrunning;
+ 		d = status->avail;
+ 	}
+@@ -755,6 +761,7 @@ static int _snd_pcm_share_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *delayp)
+ 	case SND_PCM_STATE_XRUN:
+ 		return -EPIPE;
+ 	case SND_PCM_STATE_RUNNING:
++	case SND_PCM_STATE_STARTING:
+ 		break;
+ 	case SND_PCM_STATE_DRAINING:
+ 		if (pcm->stream == SND_PCM_STREAM_PLAYBACK)
+@@ -783,7 +790,8 @@ static snd_pcm_sframes_t snd_pcm_share_avail_update(snd_pcm_t *pcm)
+ 	snd_pcm_share_slave_t *slave = share->slave;
+ 	snd_pcm_sframes_t avail;
+ 	Pthread_mutex_lock(&slave->mutex);
+-	if (share->state == SND_PCM_STATE_RUNNING) {
++	if (share->state == SND_PCM_STATE_RUNNING ||
++	    share->state == SND_PCM_STATE_STARTING) {
+ 		avail = snd_pcm_avail_update(slave->pcm);
+ 		if (avail < 0) {
+ 			Pthread_mutex_unlock(&slave->mutex);
+@@ -821,7 +829,8 @@ static snd_pcm_sframes_t _snd_pcm_share_mmap_commit(snd_pcm_t *pcm,
+ 	snd_pcm_sframes_t ret;
+ 	snd_pcm_sframes_t frames;
+ 	if (pcm->stream == SND_PCM_STREAM_PLAYBACK &&
+-	    share->state == SND_PCM_STATE_RUNNING) {
++	    (share->state == SND_PCM_STATE_RUNNING ||
++	     share->state == SND_PCM_STATE_STARTING)) {
+ 		frames = *spcm->appl.ptr - share->appl_ptr;
+ 		if (frames > (snd_pcm_sframes_t)pcm->buffer_size)
+ 			frames -= pcm->boundary;
+@@ -835,7 +844,8 @@ static snd_pcm_sframes_t _snd_pcm_share_mmap_commit(snd_pcm_t *pcm,
+ 		}
+ 	}
+ 	snd_pcm_mmap_appl_forward(pcm, size);
+-	if (share->state == SND_PCM_STATE_RUNNING) {
++	if (share->state == SND_PCM_STATE_RUNNING ||
++	    share->state == SND_PCM_STATE_STARTING) {
+ 		frames = _snd_pcm_share_slave_forward(slave);
+ 		if (frames > 0) {
+ 			snd_pcm_sframes_t err;
+@@ -878,6 +888,7 @@ static int snd_pcm_share_prepare(snd_pcm_t *pcm)
+ 		err = -EBADFD;
+ 		goto _end;
+ 	case SND_PCM_STATE_RUNNING:
++	case SND_PCM_STATE_STARTING:
+ 		err = -EBUSY;
+ 		goto _end;
+ 	case SND_PCM_STATE_PREPARED:
+@@ -980,6 +991,16 @@ static int snd_pcm_share_start(snd_pcm_t *pcm)
+ 	return err;
+ }
+ 
++int snd_pcm_share_start_at(snd_pcm_t *pcm, int clock_class, int audio_clock_type, const snd_htimestamp_t *start_time)
++{
++	snd_pcm_share_t *share = pcm->private_data;
++
++	if(clock_class == SNDRV_PCM_CLOCK_CLASS_SYSTEM)
++		return snd_pcm_start_at_system(share->slave->pcm, audio_clock_type, start_time);
++	else
++		return snd_pcm_start_at_audio(share->slave->pcm, audio_clock_type, start_time);
++}
++
+ static int snd_pcm_share_pause(snd_pcm_t *pcm ATTRIBUTE_UNUSED, int enable ATTRIBUTE_UNUSED)
+ {
+ 	return -ENOSYS;
+@@ -1010,6 +1031,7 @@ static snd_pcm_sframes_t _snd_pcm_share_rewind(snd_pcm_t *pcm, snd_pcm_uframes_t
+ 	snd_pcm_sframes_t n;
+ 	switch (share->state) {
+ 	case SND_PCM_STATE_RUNNING:
++	case SND_PCM_STATE_STARTING:
+ 		break;
+ 	case SND_PCM_STATE_PREPARED:
+ 		if (pcm->stream != SND_PCM_STREAM_PLAYBACK)
+@@ -1028,7 +1050,7 @@ static snd_pcm_sframes_t _snd_pcm_share_rewind(snd_pcm_t *pcm, snd_pcm_uframes_t
+ 	assert(n >= 0);
+ 	if ((snd_pcm_uframes_t)n > frames)
+ 		frames = n;
+-	if (share->state == SND_PCM_STATE_RUNNING && frames > 0) {
++	if ((share->state == SND_PCM_STATE_RUNNING || share->state == SND_PCM_STATE_STARTING) && frames > 0) {
+ 		snd_pcm_sframes_t ret = snd_pcm_rewind(slave->pcm, frames);
+ 		if (ret < 0)
+ 			return ret;
+@@ -1068,6 +1090,7 @@ static snd_pcm_sframes_t _snd_pcm_share_forward(snd_pcm_t *pcm, snd_pcm_uframes_
+ 	snd_pcm_sframes_t n;
+ 	switch (share->state) {
+ 	case SND_PCM_STATE_RUNNING:
++	case SND_PCM_STATE_STARTING:
+ 		break;
+ 	case SND_PCM_STATE_PREPARED:
+ 		if (pcm->stream != SND_PCM_STREAM_PLAYBACK)
+@@ -1085,7 +1108,7 @@ static snd_pcm_sframes_t _snd_pcm_share_forward(snd_pcm_t *pcm, snd_pcm_uframes_
+ 	n = snd_pcm_mmap_avail(pcm);
+ 	if ((snd_pcm_uframes_t)n > frames)
+ 		frames = n;
+-	if (share->state == SND_PCM_STATE_RUNNING && frames > 0) {
++	if ((share->state == SND_PCM_STATE_RUNNING || share->state == SND_PCM_STATE_STARTING) && frames > 0) {
+ 		snd_pcm_sframes_t ret = INTERNAL(snd_pcm_forward)(slave->pcm, frames);
+ 		if (ret < 0)
+ 			return ret;
+@@ -1179,6 +1202,7 @@ static int snd_pcm_share_drain(snd_pcm_t *pcm)
+ 			goto _end;
+ 		case SND_PCM_STATE_DRAINING:
+ 		case SND_PCM_STATE_RUNNING:
++		case SND_PCM_STATE_STARTING:
+ 			share->state = SND_PCM_STATE_DRAINING;
+ 			_snd_pcm_share_update(pcm);
+ 			Pthread_mutex_unlock(&slave->mutex);
+@@ -1231,6 +1255,7 @@ static int snd_pcm_share_drop(snd_pcm_t *pcm)
+ 		}
+ 		/* Fall through */
+ 	case SND_PCM_STATE_RUNNING:
++	case SND_PCM_STATE_STARTING:
+ 		_snd_pcm_share_stop(pcm, SND_PCM_STATE_SETUP);
+ 		_snd_pcm_share_update(pcm);
+ 		break;
+@@ -1331,6 +1356,7 @@ static const snd_pcm_fast_ops_t snd_pcm_share_fast_ops = {
+ 	.prepare = snd_pcm_share_prepare,
+ 	.reset = snd_pcm_share_reset,
+ 	.start = snd_pcm_share_start,
++	.start_at = snd_pcm_share_start_at,
+ 	.drop = snd_pcm_share_drop,
+ 	.drain = snd_pcm_share_drain,
+ 	.pause = snd_pcm_share_pause,
+diff --git a/test/pcm.c b/test/pcm.c
+index 18b6176..6c491fc 100644
+--- a/test/pcm.c
++++ b/test/pcm.c
+@@ -300,6 +300,7 @@ static int write_and_poll_loop(snd_pcm_t *handle,
+ 	double phase = 0;
+ 	signed short *ptr;
+ 	int err, count, cptr, init;
++	snd_pcm_state_t state;
+ 
+ 	count = snd_pcm_poll_descriptors_count (handle);
+ 	if (count <= 0) {
+@@ -350,7 +351,9 @@ static int write_and_poll_loop(snd_pcm_t *handle,
+ 				init = 1;
+ 				break;	/* skip one period */
+ 			}
+-			if (snd_pcm_state(handle) == SND_PCM_STATE_RUNNING)
++			state = snd_pcm_state(handle);
++			if (state == SND_PCM_STATE_RUNNING ||
++			    state == SND_PCM_STATE_STARTING)
+ 				init = 0;
+ 			ptr += err * channels;
+ 			cptr -= err;
+-- 
+2.6.2
+
