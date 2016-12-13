@@ -1,0 +1,128 @@
+From 04ced6ea21325b7b40c311b8e51c6ad29c47b2a3 Mon Sep 17 00:00:00 2001
+From: Matin Momin <Matin.Momin@imgtec.com>
+Date: Thu, 1 Sep 2016 17:31:59 +0530
+Subject: [PATCH 1/1] rtsp-stream: Add API to set udp multicast interface
+
+With gst_rtsp_stream_set_mcast_iface API we can set on which
+interface we want to route multicast data.
+
+Signed-off-by: Matin Momin <Matin.Momin@imgtec.com>
+Signed-off-by: Abhimanyu V <Abhimanyu.V@imgtec.com>
+---
+diff -Nrpu gst1-rtsp-server-1.8.2/gst/rtsp-server/rtsp-stream.c gst1-rtsp-server-1.8.2_old/gst/rtsp-server/rtsp-stream.c
+--- gst1-rtsp-server-1.8.2/gst/rtsp-server/rtsp-stream.c	2016-05-04 12:51:55.000000000 +0530
++++ gst1-rtsp-server-1.8.2_old/gst/rtsp-server/rtsp-stream.c	2016-12-09 13:44:31.592400050 +0530
+@@ -142,6 +142,7 @@ struct _GstRTSPStreamPrivate
+   GstRTSPAddressPool *pool;
+   GstRTSPAddress *addr_v4;
+   GstRTSPAddress *addr_v6;
++  gchar *mcast_iface;
+   gboolean have_ipv4_mcast;
+   gboolean have_ipv6_mcast;
+ 
+@@ -173,6 +174,7 @@ struct _GstRTSPStreamPrivate
+ #define DEFAULT_PROFILES        GST_RTSP_PROFILE_AVP
+ #define DEFAULT_PROTOCOLS       GST_RTSP_LOWER_TRANS_UDP | GST_RTSP_LOWER_TRANS_UDP_MCAST | \
+                                         GST_RTSP_LOWER_TRANS_TCP
++#define DEFAULT_MCAST_IFACE     NULL
+ 
+ enum
+ {
+@@ -262,6 +264,7 @@ gst_rtsp_stream_init (GstRTSPStream * st
+   priv->control = g_strdup (DEFAULT_CONTROL);
+   priv->profiles = DEFAULT_PROFILES;
+   priv->protocols = DEFAULT_PROTOCOLS;
++  priv->mcast_iface = DEFAULT_MCAST_IFACE;
+ 
+   g_mutex_init (&priv->lock);
+ 
+@@ -316,6 +319,7 @@ gst_rtsp_stream_finalize (GObject * obj)
+     g_critical ("Unreffing udpsrcs hash table that contains elements.");
+   g_hash_table_unref (priv->udpsrcs);
+ 
++  g_free (priv->mcast_iface);
+   G_OBJECT_CLASS (gst_rtsp_stream_parent_class)->finalize (obj);
+ }
+ 
+@@ -1076,6 +1080,10 @@ create_and_configure_udpsinks (GstRTSPSt
+   g_object_set (G_OBJECT (udpsink0), "close-socket", FALSE, NULL);
+   g_object_set (G_OBJECT (udpsink1), "close-socket", FALSE, NULL);
+ 
++  GST_DEBUG_OBJECT (stream, "setting udp mcast iface to %s", priv->mcast_iface);
++  g_object_set (G_OBJECT (udpsink0), "multicast-iface", priv->mcast_iface, NULL);
++  g_object_set (G_OBJECT (udpsink1), "multicast-iface", priv->mcast_iface, NULL);
++
+   g_object_set (G_OBJECT (udpsink0), "send-duplicates", FALSE, NULL);
+   g_object_set (G_OBJECT (udpsink1), "send-duplicates", FALSE, NULL);
+ 
+@@ -1124,6 +1132,9 @@ play_udpsources_one_family (GstRTSPStrea
+   bin = GST_BIN (gst_object_get_parent (GST_OBJECT (priv->funnel[1])));
+ 
+   for (i = 0; i < 2; i++) {
++    g_object_set (G_OBJECT (udpsrc_out[i]),
++      "multicast-iface", priv->mcast_iface, NULL);
++
+     if (priv->sinkpad || i == 1) {
+       if (priv->srcpad) {
+         /* we set and keep these to playing so that they don't cause NO_PREROLL return
+@@ -3825,3 +3836,49 @@ gst_rtsp_stream_query_stop (GstRTSPStrea
+   return ret;
+ 
+ }
++
++/**
++ * gst_rtsp_stream_set_mcast_iface:
++ * @stream: a #GstRTSPStream
++ * @iface: multicast network interface
++ *
++ * Configure the udp sink of @stream to multicast on interface @iface.
++ * Returns: %TRUE if interface successfully configured
++ */
++
++gboolean
++gst_rtsp_stream_set_mcast_iface (GstRTSPStream *stream, const gchar * iface)
++{
++  GstRTSPStreamPrivate *priv;
++  GHashTableIter iter;
++  gpointer iter_key, iter_value;
++
++  g_return_val_if_fail (GST_IS_RTSP_STREAM (stream), FALSE);
++
++  priv = stream->priv;
++
++  g_mutex_lock (&priv->lock);
++  g_free (priv->mcast_iface);
++  priv->mcast_iface = g_strdup (iface);
++  if (priv->udpsink[0])
++    g_object_set (G_OBJECT (priv->udpsink[0]), "multicast-iface", iface, NULL);
++  if (priv->udpsink[1])
++    g_object_set (G_OBJECT (priv->udpsink[1]), "multicast-iface", iface, NULL);
++
++  g_hash_table_iter_init (&iter, priv->udpsrcs);
++  while (g_hash_table_iter_next (&iter, &iter_key, &iter_value)) {
++    GstRTSPStreamUDPSrcs *transport_udpsrcs =
++        (GstRTSPStreamUDPSrcs *) iter_value;
++
++    for (int i = 0; i < 2; i++) {
++      if (transport_udpsrcs->udpsrc[i]) {
++	       g_object_set (G_OBJECT (transport_udpsrcs->udpsrc[i]), "multicast-iface", iface, NULL);
++      }
++    }
++  }
++
++  g_mutex_unlock (&priv->lock);
++
++  return TRUE;
++}
++
+diff -Nrpu gst1-rtsp-server-1.8.2/gst/rtsp-server/rtsp-stream.h gst1-rtsp-server-1.8.2_old/gst/rtsp-server/rtsp-stream.h
+--- gst1-rtsp-server-1.8.2/gst/rtsp-server/rtsp-stream.h	2016-03-24 17:06:50.000000000 +0530
++++ gst1-rtsp-server-1.8.2_old/gst/rtsp-server/rtsp-stream.h	2016-12-07 13:18:04.625837077 +0530
+@@ -171,6 +171,7 @@ GstElement *      gst_rtsp_stream_reques
+ 
+ gboolean          gst_rtsp_stream_allocate_udp_sockets       (GstRTSPStream * stream, GSocketFamily family,
+                                                               GstRTSPTransport *transport, gboolean use_client_setttings);
++gboolean          gst_rtsp_stream_set_mcast_iface            (GstRTSPStream *stream, const gchar * iface);
+ /**
+  * GstRTSPStreamTransportFilterFunc:
+  * @stream: a #GstRTSPStream object
